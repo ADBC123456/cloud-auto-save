@@ -62,6 +62,7 @@ export type TaskItem = {
     reason?: string | null
   } | null
   enabled: boolean
+  paused_until?: string | null
   addition: Record<string, any>
   extra: TaskExtraConfig
   created_at: string

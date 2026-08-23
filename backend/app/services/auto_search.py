@@ -16,6 +16,7 @@ from app.models.drive_account import DriveAccount
 from app.models.task import Task
 from app.schemas.task_browse import SharePreviewBatchIn
 from app.services.resource_search import fetch_task_suggestions
+from app.services.task_pause import is_task_week_paused
 from app.services.share_preview_batch import preview_share_batch
 
 logger = logging.getLogger(__name__)
@@ -403,6 +404,8 @@ def auto_repair_banned_tasks(db: Session) -> list[dict[str, Any]]:
         return summaries
     for task in tasks:
         if not is_auto_search_task(task):
+            continue
+        if is_task_week_paused(task):
             continue
         if task.shareurl and not task.shareurl_ban:
             # 链接体检：明确验证失败（坏链/已删除）时进入换链流程

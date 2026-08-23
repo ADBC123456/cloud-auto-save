@@ -29,6 +29,7 @@ class Task(Base):
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tmdb_media_type: Mapped[str | None] = mapped_column(String(8), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+    paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     addition_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     extra_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

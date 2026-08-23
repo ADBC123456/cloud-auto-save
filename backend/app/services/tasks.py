@@ -253,6 +253,20 @@ def set_task_enabled(db: Session, task_id: int, enabled: bool) -> Task:
     return task
 
 
+def mark_task_week_complete(db: Session, task_id: int) -> Task:
+    from app.services.task_pause import compute_next_resume_utc_naive, get_task_run_weekdays
+
+    task = get_task(db, task_id)
+    task.paused_until = compute_next_resume_utc_naive(get_task_run_weekdays(db, task))
+    return task
+
+
+def clear_task_week_pause(db: Session, task_id: int) -> Task:
+    task = get_task(db, task_id)
+    task.paused_until = None
+    return task
+
+
 def delete_task(db: Session, task_id: int) -> None:
     task = get_task(db, task_id)
     db.query(SyncTaskDramaLink).filter(SyncTaskDramaLink.task_uid == str(task.task_uid)).delete(synchronize_session=False)

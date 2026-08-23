@@ -104,6 +104,7 @@ class TaskOut(BaseModel):
     tmdb_is_ended: bool | None = None
     drama_update_progress: DramaUpdateProgressOut | None = None
     enabled: bool
+    paused_until: datetime | None = None
     addition: dict[str, Any] = {}
     extra: dict[str, Any] = {}
     executions: list[TaskExecutionOut] = []

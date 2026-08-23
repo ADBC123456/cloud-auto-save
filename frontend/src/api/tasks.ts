@@ -79,6 +79,16 @@ export async function setTaskStatus(taskId: number, enabled: boolean) {
   return data
 }
 
+export async function markTaskWeekComplete(taskId: number) {
+  const { data } = await http.post<TaskItem>(`/tasks/${taskId}/week-complete`)
+  return data
+}
+
+export async function resumeTaskWeek(taskId: number) {
+  const { data } = await http.post<TaskItem>(`/tasks/${taskId}/week-resume`)
+  return data
+}
+
 export async function runTask(taskId: number) {
   const { data } = await http.post<TaskExecutionItem>(`/tasks/${taskId}/run`)
   return data

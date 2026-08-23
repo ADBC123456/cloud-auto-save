@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.models.task import Task
 from app.services.auto_search import get_auto_search_conf, run_auto_search, run_task_after_found
+from app.services.task_pause import is_task_week_paused
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,9 @@ class AutoSearchSchedulerManager:
             with SessionLocal() as db:
                 task = db.get(Task, task_id)
                 if not task or not task.enabled or str(task.task_uid or "") != task_uid:
+                    return
+                if is_task_week_paused(task):
+                    logger.info("[自动搜索] %s 本周休眠中，跳过（paused_until=%s）", task.taskname, task.paused_until)
                     return
                 summary = run_auto_search(db, task, trigger="scheduler")
                 logger.info(

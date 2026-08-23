@@ -17,6 +17,7 @@ from app.models.task import Task
 from app.services.notifications.sender import send_runtime
 from app.services.notifications.task_notify import DRAMA_NOTIFY_TITLE, build_task_section
 from app.services.task_scheduler import get_or_create_task_scheduler_setting
+from app.services.task_pause import is_paused_value
 from app.services.drama_share_repair import repair_banned_drama_tasks
 from app.services.tmdb_cache import purge_cold_cache, refresh_expired_cache, refresh_linked_tasks
 from app.services.tmdb_cache_scheduler import get_or_create_tmdb_cache_scheduler_setting
@@ -212,11 +213,13 @@ def run_drama_tasks() -> None:
         except Exception:
             db.rollback()
         rows = (
-            db.execute(select(Task.id, Task.task_uid, Task.account_name, Task.shareurl).where(Task.enabled.is_(True), Task.task_type == "drama").order_by(Task.id.asc()))
+            db.execute(select(Task.id, Task.task_uid, Task.account_name, Task.shareurl, Task.paused_until).where(Task.enabled.is_(True), Task.task_type == "drama").order_by(Task.id.asc()))
             .all()
         )
-        for tid, uid, account_name, shareurl in rows:
+        for tid, uid, account_name, shareurl, paused_until in rows:
             if tid is None:
+                continue
+            if is_paused_value(paused_until):
                 continue
             task_ids.append(int(tid))
             task_payloads.append({"task_uid": uid, "account_name": account_name, "shareurl": shareurl})

@@ -68,7 +68,8 @@ from app.services.drama_update_progress import build_drama_update_progress
 from app.services.drama_share_repair import repair_banned_drama_tasks
 from app.services.task_scheduler import get_or_create_task_scheduler_setting, update_task_scheduler_setting
 from app.services.resource_search import fetch_task_suggestions
-from app.services.tasks import create_task, delete_task, get_task, list_tasks_recent_executions, set_task_enabled, update_task
+from app.services.task_pause import paused_until_shanghai
+from app.services.tasks import clear_task_week_pause, create_task, delete_task, get_task, list_tasks_recent_executions, mark_task_week_complete, set_task_enabled, update_task
 from app.services.tmdb_settings import get_or_create_tmdb_setting, get_tmdb_runtime_config
 
 router = APIRouter()
@@ -307,6 +308,7 @@ def _task_out(
         tmdb_is_ended=tmdb_is_ended,
         drama_update_progress=drama_update_progress,
         enabled=item.enabled,
+        paused_until=paused_until_shanghai(getattr(item, "paused_until", None)),
         addition=json.loads(item.addition_json) if item.addition_json else {},
         extra=json.loads(item.extra_json) if item.extra_json else {},
         executions=[_execution_out(x) for x in raw_executions[:3]],
@@ -698,6 +700,24 @@ def patch_task_status(request: Request, task_id: int, payload: TaskStatusIn, cur
     db.commit()
     db.refresh(task)
     _reload_auto_search_jobs()
+    return _task_out(db, task)
+
+
+@router.post('/{task_id:int}/week-complete', response_model=TaskOut, dependencies=[Depends(require_permissions(TASK_WRITE))])
+def post_task_week_complete(request: Request, task_id: int, current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    task = mark_task_week_complete(db, task_id)
+    audit.write_audit_log(db, actor_user_id=current.user.id, action='task.week_complete', target_type='task', target_id=str(task_id), ip=request.client.host if request.client else None, user_agent=request.headers.get('user-agent'), success=True, detail=f'paused_until={task.paused_until}')
+    db.commit()
+    db.refresh(task)
+    return _task_out(db, task)
+
+
+@router.post('/{task_id:int}/week-resume', response_model=TaskOut, dependencies=[Depends(require_permissions(TASK_WRITE))])
+def post_task_week_resume(request: Request, task_id: int, current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    task = clear_task_week_pause(db, task_id)
+    audit.write_audit_log(db, actor_user_id=current.user.id, action='task.week_resume', target_type='task', target_id=str(task_id), ip=request.client.host if request.client else None, user_agent=request.headers.get('user-agent'), success=True, detail='paused_until=null')
+    db.commit()
+    db.refresh(task)
     return _task_out(db, task)
 
 

@@ -7,7 +7,9 @@ import {
   deleteTask,
   fetchTaskSchedulerSetting,
   fetchTasks,
+  markTaskWeekComplete,
   repairBannedDramaTasks,
+  resumeTaskWeek,
   syncDramaSavepathSnapshots,
   stopCompletedDramaTasks,
   setTaskStatus,
@@ -351,6 +353,43 @@ function formatTaskSaveError(e: any): string | null {
 async function handleToggle(row: TaskItem, enabled: boolean) {
   await setTaskStatus(row.id, enabled)
   ElMessage.success('状态已更新')
+  await loadData()
+}
+
+function isWeekPaused(row: TaskItem) {
+  if (!row.paused_until) return false
+  const d = new Date(row.paused_until)
+  return !Number.isNaN(d.getTime()) && d.getTime() > Date.now()
+}
+
+function weekPausedShort(row: TaskItem) {
+  if (!row.paused_until) return '下轮'
+  const d = new Date(row.paused_until)
+  if (Number.isNaN(d.getTime())) return '下轮'
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${mm}-${dd}`
+}
+
+async function handleWeekComplete(row: TaskItem) {
+  try {
+    if (isWeekPaused(row)) {
+      await ElMessageBox.confirm(`恢复任务「${row.taskname}」的自动调度？`, '恢复休眠', { type: 'info' })
+      await resumeTaskWeek(row.id)
+      ElMessage.success('已恢复，自动调度立即生效')
+    } else {
+      await ElMessageBox.confirm(
+        `标记任务「${row.taskname}」本周已完成？\n\n- 本周内不再自动运行 / 自动搜索 / 补链巡检\n- 到任务下一个运行日开始日 00:00 自动恢复（如周六/日任务 → 下周六）`,
+        '本周完成',
+        { type: 'info' },
+      )
+      await markTaskWeekComplete(row.id)
+      ElMessage.success('已休眠，到下个运行日自动恢复')
+    }
+  } catch (e) {
+    if (e !== 'cancel' && (e as Error)?.message !== 'cancel') throw e
+    return
+  }
   await loadData()
 }
 
@@ -1082,15 +1121,17 @@ onBeforeUnmount(() => {
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="enabled" label="状态" width="100">
+        <el-table-column prop="enabled" label="状态" width="140">
           <template #default="{ row }">
             <el-tag :type="row.enabled ? 'primary' : 'danger'">{{ row.enabled ? '启用' : '禁用' }}</el-tag>
+            <el-tag v-if="isWeekPaused(row)" type="warning" effect="plain" style="margin-left: 4px">休眠至{{ weekPausedShort(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="操作" :width="isPad ? 240 : 320" fixed="right">
           <template #default="{ row }">
             <div v-if="showAllActions" class="task-actions">
               <el-button v-if="canWrite" :type="row.enabled ? 'danger' : 'primary'" text bg  @click="handleToggle(row, !row.enabled)">{{ row.enabled ? '禁用' : '启用' }}</el-button>
+              <el-button v-if="canWrite" text bg type="info" @click="handleWeekComplete(row)">{{ isWeekPaused(row) ? '恢复' : '本周完成' }}</el-button>
               <el-button
                 v-if="canRun && isAutoSearchEnabled(row)"
                 text
@@ -1116,6 +1157,7 @@ onBeforeUnmount(() => {
             </div>
             <div v-else class="task-actions">
               <el-button v-if="canWrite" text bg :type="row.enabled ? 'danger' : 'primary'"  @click="handleToggle(row, !row.enabled)">{{ row.enabled ? '禁用' : '启用' }}</el-button>
+              <el-button v-if="canWrite" text bg type="info" @click="handleWeekComplete(row)">{{ isWeekPaused(row) ? '恢复' : '本周完成' }}</el-button>
               <el-button
                 v-if="canRun && isAutoSearchEnabled(row)"
                 text
@@ -1156,8 +1198,11 @@ onBeforeUnmount(() => {
             <div class="task-card__title">
               <span>{{ row.taskname }}</span>
               <el-tag v-if="row.shareurl_ban" type="danger" effect="plain" style="margin-left: 8px">封禁</el-tag>
+              <el-tag v-if="isWeekPaused(row)" type="warning" effect="plain" style="margin-left: 8px">休眠至{{ weekPausedShort(row) }}</el-tag>
             </div>
-            <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '禁用' }}</el-tag>
+            <div>
+              <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '禁用' }}</el-tag>
+            </div>
           </div>
           <div class="task-card__meta">
             <div class="task-card__meta-row"><span class="task-card__label">账号</span>{{ formatAccountLabel(row) }}</div>
@@ -1198,6 +1243,7 @@ onBeforeUnmount(() => {
           <div class="task-card__actions">
             <div class="task-actions">
               <el-button v-if="canWrite" text bg :type="row.enabled ? 'danger' : 'primary'" @click="handleToggle(row, !row.enabled)">{{ row.enabled ? '禁用' : '启用' }}</el-button>
+              <el-button v-if="canWrite" text bg type="info" @click="handleWeekComplete(row)">{{ isWeekPaused(row) ? '恢复' : '本周完成' }}</el-button>
               <el-button
                 v-if="canRun && isAutoSearchEnabled(row)"
                 text
