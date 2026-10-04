@@ -38,8 +38,9 @@ const resourceSearch = reactive({
     enabled: false,
     server: 'https://unisearchso.shop',
     username: '',
-    token: '',
     passwordInput: '',
+    hasPassword: false,
+    autoReplace: false,
   },
 })
 
@@ -125,7 +126,8 @@ function applySources(list: ResourceSearchSourceItem[]) {
     resourceSearch.unisearch.enabled = Boolean(us.enabled)
     resourceSearch.unisearch.server = String(us.server || 'https://unisearchso.shop')
     resourceSearch.unisearch.username = String(us.username || '')
-    resourceSearch.unisearch.token = String(us.token || '')
+    resourceSearch.unisearch.hasPassword = Boolean(us.has_password)
+    resourceSearch.unisearch.autoReplace = Boolean(us.auto_replace)
   }
 }
 
@@ -242,12 +244,13 @@ async function saveSource(key: 'net' | 'cloudsaver' | 'pansou' | 'unisearch') {
         enabled: Boolean(resourceSearch.unisearch.enabled),
         server: resourceSearch.unisearch.server ? String(resourceSearch.unisearch.server).trim() : null,
         username: resourceSearch.unisearch.username ? String(resourceSearch.unisearch.username).trim() : null,
+        auto_replace: resourceSearch.unisearch.autoReplace,
       }
       const usPw = String(resourceSearch.unisearch.passwordInput || '')
       if (usPw.trim()) usPayload.password = usPw
       await patchResourceSearchSource('unisearch', usPayload)
       resourceSearch.unisearch.passwordInput = ''
-      ElMessage.success('已保存')
+      ElMessage.success(resourceSearch.unisearch.enabled ? '已保存，登录成功' : '已保存')
       await refreshSources()
       return
     }
@@ -478,7 +481,7 @@ onMounted(() => {
             <el-form-item label="用户名">
               <el-input v-model="resourceSearch.cloudsaver.username" placeholder="用户名" />
             </el-form-item>
-            <el-form-item label="密码（留空表示不修改）">
+            <el-form-item :label="resourceSearch.unisearch.hasPassword ? '密码（已保存，留空保留）' : '密码'">
               <el-input v-model="resourceSearch.cloudsaver.passwordInput" type="password" show-password placeholder="请输入新密码" />
             </el-form-item>
             <el-form-item label="Token（自动维护）">
@@ -524,8 +527,8 @@ onMounted(() => {
             <el-form-item label="密码（留空表示不修改）">
               <el-input v-model="resourceSearch.unisearch.passwordInput" type="password" show-password placeholder="请输入新密码" />
             </el-form-item>
-            <el-form-item label="Token（自动维护）">
-              <el-input v-model="resourceSearch.unisearch.token" disabled placeholder="自动登录后会写入 token" />
+            <el-form-item label="按 TMDB 更新日自动换源">
+              <el-switch v-model="resourceSearch.unisearch.autoReplace" :disabled="!canWrite || !resourceSearch.unisearch.enabled" />
             </el-form-item>
           </el-form>
         </el-card>

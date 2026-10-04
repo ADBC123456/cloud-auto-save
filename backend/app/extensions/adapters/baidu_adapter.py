@@ -54,6 +54,13 @@ def _dump_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
+class _ShareResponseError(ValueError):
+    def __init__(self, message: str, *, code: int = 1, status: int = 502):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 # ==================== API 节点 ====================
 class PcsNode:
     """PCS API 节点"""
@@ -562,6 +569,15 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         return "/"
 
     # ==================== 分享链接操作 ====================
+    def _check_share_response(self, info: Dict) -> Dict:
+        if not isinstance(info, dict):
+            raise _ShareResponseError("百度分享接口返回格式异常")
+        errno = info.get("errno", info.get("error_code", 0))
+        if errno not in (None, 0, "0"):
+            code = int(errno)
+            raise _ShareResponseError(f"百度分享接口错误 errno={code}: {self._get_error_message(code)}", code=code, status=429 if code == -65 else 400)
+        return info
+
     def _shared_init_url(self, shared_url: str) -> str:
         """获取分享初始化 URL"""
         u = urlparse(shared_url)
@@ -597,32 +613,37 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         headers["Referer"] = init_url
 
         resp = self._request("POST", url, params=params, headers=headers, data=data)
+        resp.raise_for_status()
 
         # 更新 cookies
         self._session.cookies.update(resp.cookies.get_dict())
 
-        return self._check_response(resp.json())
+        info = self._check_share_response(resp.json())
+        if "errno" not in info and "error_code" not in info:
+            raise _ShareResponseError("百度分享验证接口未返回状态")
+        return info
 
     def _api_shared_paths(self, shared_url: str) -> Dict:
         """获取分享文件列表（从 HTML 解析）"""
         resp = self._request("GET", shared_url, params=None)
+        resp.raise_for_status()
         html = resp.text
 
         # 更新 cookies
         self._session.cookies.update(resp.cookies.get_dict())
 
         # 解析 yunData.setData 或 locals.mset
-        match = re.search(r"(?:yunData\.setData|locals\.mset)\((.+?)\);", html)
-        if not match:
-            logger.error("[Baidu] 无法解析分享页面数据")
-            return {}
-
-        try:
-            shared_data = json.loads(match.group(1))
-            return shared_data
-        except json.JSONDecodeError as e:
-            logger.error(f"[Baidu] 解析分享数据 JSON 失败: {e}")
-            return {}
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"(?:yunData\.setData|locals\.mset)\s*\(", html):
+            try:
+                shared_data, _end = decoder.raw_decode(html[match.end():].lstrip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(shared_data, dict) and "file_list" in shared_data:
+                return self._check_share_response(shared_data)
+            if isinstance(shared_data, dict) and shared_data.get("errno") not in (None, 0, "0"):
+                self._check_share_response(shared_data)
+        raise _ShareResponseError("无法解析百度分享页面文件列表，请检查登录状态或网页访问验证")
 
     def _api_list_shared_paths(
         self,
@@ -650,7 +671,11 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             "showempty": "0",
         }
         resp = self._request("GET", url, params=params)
-        return self._check_response(resp.json())
+        resp.raise_for_status()
+        info = self._check_share_response(resp.json())
+        if not isinstance(info.get("list"), list):
+            raise _ShareResponseError("百度分享目录接口未返回文件列表")
+        return info
 
     def _api_transfer_shared_paths(
         self,
@@ -871,6 +896,8 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         except Exception as e:
             error_msg = str(e)
             logger.error(f"[Baidu] 访问分享失败: {error_msg}")
+            if isinstance(e, _ShareResponseError):
+                return {"status": e.status, "code": e.code, "message": error_msg}
             errno_match = re.search(r"errno[=:]?\s*(-?\d+)", error_msg)
             if errno_match:
                 errno = int(errno_match.group(1))
@@ -905,12 +932,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             # 获取分享数据
             shared_data = self._api_shared_paths(share_url)
             if not shared_data:
-                return {
-                    "code": 0,
-                    "message": "success",
-                    "data": {"list": [], "full_path": []},
-                    "metadata": {"_total": 0},
-                }
+                raise _ShareResponseError("百度分享页面没有返回有效数据")
 
             uk = shared_data.get("share_uk") or shared_data.get("uk")
             if uk:
@@ -921,6 +943,8 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             file_list = shared_data.get("file_list", [])
             if isinstance(file_list, dict):
                 file_list = file_list.get("list", [])
+            if not isinstance(file_list, list):
+                raise _ShareResponseError("百度分享页面文件列表格式异常")
 
             if not file_list:
                 return {
@@ -950,8 +974,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
                 if path_str:
                     remote_path = path_str
                 else:
-                    first_item = file_list[0]
-                    remote_path = self._get_item_path(first_item)
+                    raise ValueError("分享内未找到指定目录，请重新选择资源文件夹")
                 if fetch_share_full_path:
                     full_path = breadcrumb
             else:
@@ -988,7 +1011,8 @@ class BaiduAdapter(BaseCloudDriveAdapter):
 
         except Exception as e:
             logger.error(f"[Baidu] 获取分享详情失败: {e}")
-            return {"code": 1, "message": f"获取分享详情失败: {e}", "data": {"list": []}}
+            status = getattr(e, "status", 502 if isinstance(e, requests.RequestException) else 400)
+            return {"status": status, "code": getattr(e, "code", 1), "message": f"获取分享详情失败: {e}", "data": {"list": []}}
 
     def _convert_shared_item(self, item: Dict) -> Dict:
         """转换百度分享文件项为统一格式"""

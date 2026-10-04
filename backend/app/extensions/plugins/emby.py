@@ -10,6 +10,7 @@ class Emby:
     default_config = {
         "url": "",  # Emby服务器地址
         "token": "",  # Emby服务器token
+        "library_id": "",  # 新剧未匹配到时刷新此媒体库
     }
     default_task_config = {
         "try_match": True,  # 是否尝试匹配
@@ -19,6 +20,7 @@ class Emby:
 
     def __init__(self, **kwargs):
         self.plugin_name = self.__class__.__name__.lower()
+        self.library_id = str(kwargs.get("library_id") or "").strip()
         if kwargs:
             for key, _ in self.default_config.items():
                 if key in kwargs:
@@ -42,6 +44,8 @@ class Emby:
                 task_config["media_id"] = match_media_id
                 task.setdefault("addition", {})[self.plugin_name] = task_config
                 return task
+            elif self.library_id:
+                self.refresh(self.library_id)
 
     def get_info(self):
         url = f"{self.url}/emby/System/Info"

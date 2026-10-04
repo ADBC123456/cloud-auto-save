@@ -6,7 +6,7 @@ export async function fetchResourceSearchSources() {
   return data
 }
 
-export async function patchResourceSearchSource(key: ResourceSearchSourceKey, payload: Partial<{ enabled: boolean; server: string | null; username: string | null; password: string | null; token: string | null }>) {
+export async function patchResourceSearchSource(key: ResourceSearchSourceKey, payload: Partial<{ enabled: boolean; server: string | null; username: string | null; password: string | null; token: string | null; auto_replace: boolean }>) {
   const { data } = await http.patch<ResourceSearchSourceListResponse>(`/resource-search/sources/${encodeURIComponent(key)}`, payload)
   return data
 }

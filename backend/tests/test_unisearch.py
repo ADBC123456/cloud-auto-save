@@ -1,0 +1,260 @@
+import json
+from datetime import datetime
+from unittest.mock import Mock
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+import requests
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from treelib import Tree
+
+import app.models
+from app.db.base import Base
+from app.models.drive_account import DriveAccount
+from app.models.task import Task
+from app.models.task_savepath_snapshot import TaskSavepathSnapshot
+from app.schemas.task_browse import SharePreviewBatchItemOut, SharePreviewBatchLatestOut, SharePreviewBatchOut
+from app.services import drama_share_autoupdate as updates
+from app.services import resource_search as search
+from app.services.unisearch import UniSearchClient
+
+
+@pytest.fixture
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        yield session
+    engine.dispose()
+
+
+def response(data, status=200):
+    result = Mock(status_code=status)
+    result.json.return_value = data
+    if status >= 400:
+        result.raise_for_status.side_effect = requests.HTTPError()
+    return result
+
+
+def test_login_expiry_retries_once_and_updates_bearer_token():
+    client = UniSearchClient(username="user", password="secret", token="expired")
+    client.session = Mock()
+    client.session.headers = {}
+    client.session.post.side_effect = [
+        response({}, 401), response({"access_token": "renewed"}),
+        response({"resources": [{"title": "Example", "links": [{"url": "https://pan.quark.cn/s/abc"}]}]}),
+    ]
+    items = client.search("Example", cloud_type="quark")
+    assert items[0]["source"] == "UniSearch"
+    assert client.token == "renewed"
+    assert client.session.headers["Authorization"] == "Bearer renewed"
+    assert client.session.post.call_args_list[-1].kwargs["json"]["cloud_types"] == ["quark"]
+    assert client.session.post.call_count == 3
+
+
+def test_login_failure_does_not_retry_forever():
+    client = UniSearchClient(username="user", password="wrong", token="expired")
+    client.session = Mock()
+    client.session.headers = {}
+    client.session.post.side_effect = [response({}, 401), response({}, 401)]
+    with pytest.raises(requests.HTTPError):
+        client.search("Example")
+    assert client.session.post.call_count == 2
+
+
+def test_formats_direct_links_passwords_and_ignores_unusable_links():
+    items = UniSearchClient.format_results({"resources": [{
+        "title": "Example S01E10", "source": {"id": "test"}, "links": [
+            {"url": "https://pan.quark.cn/s/abc?x=1", "password": "a&b"},
+            {"url": "https://pan.quark.cn/s/abc?x=1", "password": "a&b"},
+            {"url": "https://pan.quark.cn/s/bad", "resolution": {"status": "invalid"}},
+            {"url": "https://pan.quark.cn/s/scan", "access_mode": "scan_transfer"},
+            {"url": "javascript:alert(1)"},
+        ],
+    }]})
+    assert len(items) == 1
+    assert items[0]["shareurl"] == "https://pan.quark.cn/s/abc?x=1&pwd=a%26b"
+    assert items[0]["taskname"] == "Example S01E10"
+
+
+def test_save_preserves_password_and_never_returns_credentials(db, monkeypatch):
+    login = Mock(return_value="private-token")
+    monkeypatch.setattr(UniSearchClient, "login", login)
+    search.update_source(db, "unisearch", {"enabled": True, "username": "user", "password": "private-password", "auto_replace": True})
+    search.update_source(db, "unisearch", {"enabled": True, "password": ""})
+    cfg = search._loads(search.ensure_default_sources(db)["unisearch"].config_json)
+    assert cfg["password"] == "private-password"
+    public = next(x for x in search.list_sources(db) if x["key"] == "unisearch")
+    assert public["has_password"] and public["auto_replace"]
+    assert public["password"] is None and public["token"] is None
+    assert "private" not in json.dumps(public)
+
+
+@pytest.fixture
+def drama(db, monkeypatch):
+    sources = search.ensure_default_sources(db)
+    for row in sources.values():
+        row.enabled = row.key == "unisearch"
+    sources["unisearch"].config_json = json.dumps({"auto_replace": True})
+    db.add(DriveAccount(name="quark-account", drive_type="quark", cookie="", enabled=True, runtime_status="active"))
+    task = Task(task_uid="test-task", task_type="drama", taskname="Example", shareurl="https://pan.quark.cn/s/old", savepath="/Example", account_name="quark-account", tmdb_media_type="tv", tmdb_id=123, startfid="old-source-fid")
+    db.add(task)
+    db.flush()
+    snapshot = TaskSavepathSnapshot(task_uid=task.task_uid, savepath=task.savepath, files_json="[]", saved_latest_season=1, saved_latest_episode=8)
+    db.add(snapshot)
+    db.flush()
+    context = updates._TMDBContext(names=["Example"], detail={"last_episode_to_air": {"season_number": 1, "episode_number": 10}}, weekdays=[datetime.now(ZoneInfo("Asia/Shanghai")).isoweekday()])
+    monkeypatch.setattr(updates, "_load_tmdb_context", lambda *_: context)
+    return task, snapshot, context
+
+
+def preview(url, episode=None, *, ok=True, season=1):
+    latest = SharePreviewBatchLatestOut(season=season, episode=episode, size=100) if episode else None
+    return SharePreviewBatchItemOut(shareurl=url, ok=ok, latest_video=latest)
+
+
+def install_search(monkeypatch, candidates, previews, *, old_ok=True, old_episode=8):
+    fetch = Mock(return_value=(candidates, False, None))
+    monkeypatch.setattr(updates, "fetch_task_suggestions", fetch)
+
+    def batch(_db, payload):
+        assert payload.account_name == "quark-account"
+        items = [preview(url, old_episode, ok=old_ok) if url.endswith("/old") else previews[url] for url in payload.shareurls]
+        return SharePreviewBatchOut(items=items), False
+
+    monkeypatch.setattr(updates, "preview_share_batch", batch)
+    return fetch
+
+
+@pytest.mark.parametrize("old_ok", [True, False])
+def test_reuses_matching_and_preview_to_replace_stale_or_invalid_source(db, drama, monkeypatch, old_ok):
+    task, _, _ = drama
+    new = "https://pan.quark.cn/s/new"
+    candidates = [
+        {"taskname": "Example S01E10", "shareurl": new},
+        {"taskname": "Other Show S01E10", "shareurl": "https://pan.quark.cn/s/wrong-show"},
+        {"taskname": "Example S01E10", "shareurl": "https://pan.baidu.com/s/wrong-drive"},
+    ]
+    fetch = install_search(monkeypatch, candidates, {new: preview(new, 10)}, old_ok=old_ok)
+    task.shareurl_ban = "invalid" if not old_ok else None
+    result = updates.resolve_drama_shareurl_update(db, task, on_update_day=True)
+    assert result["updated"] and result["episode"] == 10
+    assert task.shareurl == new and task.shareurl_ban is None and task.startfid is None
+    assert fetch.call_args.kwargs["drive_type"] == "quark"
+    assert fetch.call_args.kwargs["source_keys"] == ("unisearch",)
+
+
+@pytest.mark.parametrize("actual_episode,ok,season", [(8, True, 1), (7, True, 1), (None, True, 1), (10, False, 1), (10, True, 2)])
+def test_never_trusts_advertised_episode_or_downgrades(db, drama, monkeypatch, actual_episode, ok, season):
+    task, _, _ = drama
+    new = "https://pan.quark.cn/s/new"
+    install_search(monkeypatch, [{"taskname": "Example S01E10", "shareurl": new}], {new: preview(new, actual_episode, ok=ok, season=season)}, old_ok=False)
+    result = updates.resolve_drama_shareurl_update(db, task, on_update_day=True)
+    assert not result["updated"]
+    assert task.shareurl.endswith("/old") and task.startfid == "old-source-fid"
+
+
+def test_no_search_on_non_update_day(db, drama, monkeypatch):
+    task, _, context = drama
+    context.weekdays = [context.weekdays[0] % 7 + 1]
+    fetch = Mock()
+    monkeypatch.setattr(updates, "fetch_task_suggestions", fetch)
+    result = updates.resolve_drama_shareurl_update(db, task, on_update_day=True)
+    assert result["reason"] == "not_tmdb_update_day"
+    fetch.assert_not_called()
+
+
+def test_no_search_when_already_saved_latest_episode(db, drama, monkeypatch):
+    task, snapshot, _ = drama
+    snapshot.saved_latest_episode = 10
+    fetch = install_search(monkeypatch, [], {}, old_ok=False)
+    result = updates.resolve_drama_shareurl_update(db, task, on_update_day=True)
+    assert result["reason"] == "up_to_date"
+    fetch.assert_not_called()
+
+
+def test_invalid_source_with_unknown_saved_progress_is_preserved(db, drama, monkeypatch):
+    task, snapshot, _ = drama
+    snapshot.saved_latest_episode = None
+    fetch = install_search(monkeypatch, [], {}, old_ok=False)
+    result = updates.resolve_drama_shareurl_update(db, task, on_update_day=True)
+    assert result["reason"] == "progress_unknown"
+    fetch.assert_not_called()
+
+
+def test_existing_115_toggle_still_applies(db, drama):
+    task, _, _ = drama
+    result = updates.resolve_drama_shareurl_update(db, task)
+    assert result["reason"] == "not_applicable"
+
+
+def test_source_integration_filters_unavailable_drives(db, drama, monkeypatch):
+    monkeypatch.setattr(UniSearchClient, "search", lambda *_args, **_kwargs: [
+        {"taskname": "Example", "shareurl": "https://pan.quark.cn/s/new"},
+        {"taskname": "Example", "shareurl": "https://pan.baidu.com/s/unavailable"},
+    ])
+    items, _, _ = search.fetch_task_suggestions(db, "Example", 1, source_keys=("unisearch",))
+    assert [item["shareurl"] for item in items] == ["https://pan.quark.cn/s/new"]
+
+
+def test_unisearch_uses_baidu_cloud_type_name(db, monkeypatch):
+    from app.services import resource_search as service
+
+    client = Mock()
+    client.search.return_value = []
+    client.token = ""
+    monkeypatch.setattr(service, "UniSearchClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(service, "ensure_default_sources", lambda _db: {
+        key: Mock(key=key, enabled=(key == "unisearch"), config_json=(json.dumps({"username": "u", "password": "p"}) if key == "unisearch" else "{}"))
+        for key in service.SOURCE_KEYS
+    })
+    monkeypatch.setattr(service, "list_invalid_shareurls", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(service, "AdapterRegistry", Mock())
+    service.fetch_task_suggestions(db, "\u7267\u795e\u8bb0", 1, drive_type="baidu", source_keys=("unisearch",))
+    assert client.search.call_args.kwargs["cloud_type"] == "baidu"
+
+
+def test_parallel_cloudsaver_and_unisearch_renewals_are_both_saved(db, monkeypatch):
+    rows = search.ensure_default_sources(db)
+    for row in rows.values():
+        row.enabled = row.key in {"cloudsaver", "unisearch"}
+        row.config_json = json.dumps({"server": "https://example.com", "username": "user", "password": "test", "token": "old"})
+    cs = Mock()
+    cs.auto_login_search.return_value = {"success": True, "new_token": "cloudsaver-renewed", "data": {}}
+    cs.clean_search_results.return_value = []
+    us = Mock(token="unisearch-renewed")
+    us.search.return_value = []
+    monkeypatch.setattr(search, "CloudSaverClient", lambda *_args: cs)
+    monkeypatch.setattr(search, "UniSearchClient", lambda *_args, **_kwargs: us)
+    _, changed, _ = search.fetch_task_suggestions(db, "Example", 1)
+    assert changed
+    assert json.loads(rows["cloudsaver"].config_json)["token"] == "cloudsaver-renewed"
+    assert json.loads(rows["unisearch"].config_json)["token"] == "unisearch-renewed"
+
+
+def test_unisearch_timestamp_keeps_existing_china_time_search_ordering():
+    assert search._unisearch_to_cst("2026-10-04T00:30:00Z") == "2026-10-04 08:30:00"
+
+
+def test_executor_transfers_repaired_source_in_same_run(db, drama, monkeypatch):
+    from app.extensions.runtime.task_executor import TaskExecutor
+
+    task, _, _ = drama
+    task.shareurl_ban = "invalid"
+    new = "https://pan.quark.cn/s/new"
+    install_search(monkeypatch, [{"taskname": "Example S01E10", "shareurl": new}], {new: preview(new, 10)}, old_ok=False)
+    adapter = SimpleNamespace(is_active=True, nickname="test", DRIVE_TYPE="quark")
+    manager = Mock()
+    manager.get_adapter_for_task.return_value = adapter
+    manager.get_default_adapter.return_value = adapter
+    executor = TaskExecutor(db)
+    tree = Tree()
+    tree.create_node("Example", "root")
+    transfer = Mock(return_value=tree)
+    monkeypatch.setattr(executor, "_execute_drama_task", transfer)
+    execution = executor.run_task(task, account_manager=manager, defer_plugins=True, persist_execution=False)
+    assert execution.status == "success"
+    payload = transfer.call_args.args[1]
+    assert payload["shareurl"] == new and payload["startfid"] is None

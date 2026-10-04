@@ -20,10 +20,13 @@ class Openlist:
         "token": "",
         "storage_id": "",
         "root_dir": "",
+        "rclone_rc_url": "",  # rclone 目录缓存刷新地址
+        "rclone_rc_username": "",  # rclone RC 用户名
+        "rclone_rc_password": "",  # rclone RC 密码
     }
 
     default_task_config = {
-        "enable": False,
+        "enable": True,
         "driver": "",
         "mount_path": "",
         "root_dir": "",
@@ -38,6 +41,9 @@ class Openlist:
         self.token = ""
         self.storage_id = ""
         self.root_dir = ""
+        self.rclone_rc_url = ""
+        self.rclone_rc_username = ""
+        self.rclone_rc_password = ""
 
         self.timeout_seconds = 10
         self.max_retries = 3
@@ -359,11 +365,20 @@ class Openlist:
             password = addition.get("password") or ""
             do_refresh = bool(addition.get("refresh", True))
 
-            if do_refresh and savepath and mount_path and root_dir and savepath.startswith(root_dir):
-                rel = savepath.replace(root_dir, "", 1).lstrip("/")
+            savepath = self._norm_path(savepath) if savepath else ""
+            root_dir = self._norm_path(root_dir) if root_dir else ""
+            if do_refresh and savepath and mount_path and root_dir and (
+                savepath == root_dir or savepath.startswith(root_dir.rstrip("/") + "/")
+            ):
+                rel = posixpath.relpath(savepath, root_dir)
+                if rel == ".":
+                    rel = ""
                 target = self._norm_path(posixpath.join(mount_path, rel))
-                ok = self.refresh_dir(target, driver=driver or None, password=password)
+                # target already includes the mount; driver resolution would add it again.
+                password = password or (self.drivers.get(str(driver)) or {}).get("password") or ""
+                ok = self.refresh_dir(target, password=password)
                 if ok:
+                    self.refresh_mount_cache(target, mount_path)
                     logger.info("%s: 刷新目录成功 %s", self.plugin_name, target)
                 else:
                     logger.warning("%s: 刷新目录失败 %s", self.plugin_name, target)
@@ -371,6 +386,25 @@ class Openlist:
         except Exception as e:
             logger.exception("%s: 运行出错 %s", self.plugin_name, e)
             return task
+
+    def refresh_mount_cache(self, path, mount_path):
+        if not self.rclone_rc_url:
+            return
+        relative = posixpath.relpath(self._norm_path(path), self._norm_path(mount_path))
+        if relative == ".." or relative.startswith("../"):
+            raise ValueError("rclone refresh path is outside the configured mount")
+        parent = posixpath.dirname(relative)
+        if parent == ".":
+            parent = ""
+        auth = (self.rclone_rc_username, self.rclone_rc_password)
+        base = self.rclone_rc_url.rstrip("/")
+        for endpoint, payload in (
+            ("vfs/forget", {"dir": parent}),
+            ("vfs/refresh", {"dir": parent, "recursive": "false"}),
+        ):
+            response = requests.post(f"{base}/{endpoint}", json=payload, auth=auth, timeout=float(self.timeout_seconds))
+            response.raise_for_status()
+        logger.info("%s: rclone目录缓存已刷新 %s", self.plugin_name, parent or "/")
 
     def _get_stale(self, cache_key):
         with self._cache_lock:

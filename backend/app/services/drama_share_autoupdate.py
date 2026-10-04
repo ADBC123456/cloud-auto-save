@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,8 +15,9 @@ from sqlalchemy.orm import Session
 from app.extensions.runtime.adapter_registry import AdapterRegistry
 from app.extensions.runtime.guessit_fallback import guessit_title_episode_numbers
 from app.models.drive_account import DriveAccount
+from app.models.task_savepath_snapshot import TaskSavepathSnapshot
 from app.schemas.task_browse import SharePreviewBatchIn, SharePreviewBatchItemOut
-from app.services.resource_search import fetch_task_suggestions
+from app.services.resource_search import _loads, ensure_default_sources, fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
@@ -52,6 +54,7 @@ _TITLE_SEGMENT_SEPARATORS = ("|", "｜", "/", "／")
 class _TMDBContext:
     names: list[str]
     detail: dict[str, Any] | None
+    weekdays: list[int]
 
 
 @dataclass(slots=True)
@@ -155,7 +158,7 @@ def _load_tmdb_context(db: Session, task: Any) -> _TMDBContext | None:
     )
     if not names:
         return None
-    return _TMDBContext(names=names, detail=detail)
+    return _TMDBContext(names=names, detail=detail, weekdays=_episode_weekdays or _update_weekdays or [])
 
 
 def _rewrite_shareurl_with_fid(shareurl: str, fid: str | None) -> str:
@@ -263,10 +266,10 @@ def _title_matches_tmdb_names(title: str, names: list[str]) -> bool:
     return False
 
 
-def _preview_by_shareurl(db: Session, shareurls: list[str]) -> tuple[dict[str, SharePreviewBatchItemOut], bool]:
+def _preview_by_shareurl(db: Session, shareurls: list[str], *, account_name: str | None = None) -> tuple[dict[str, SharePreviewBatchItemOut], bool]:
     if not shareurls:
         return {}, False
-    out, changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=shareurls, account_name=None))
+    out, changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=shareurls, account_name=account_name))
     mapping: dict[str, SharePreviewBatchItemOut] = {}
     for row in out.items or []:
         url = str(getattr(row, "shareurl", "") or "").strip()
@@ -313,6 +316,7 @@ def _resolve_candidate(
     preview: SharePreviewBatchItemOut | None,
     fallback_season: int | None,
     tv_seasons: list[dict[str, Any]] | None = None,
+    require_video_progress: bool = False,
 ) -> _ResolvedCandidate | None:
     if preview is None or not bool(getattr(preview, "ok", False)):
         return None
@@ -323,6 +327,8 @@ def _resolve_candidate(
     latest_episode = _pick_int(getattr(latest, "episode", None) if latest is not None else None)
     season = title_season or latest_season or fallback_season
     episode = title_episode or latest_episode
+    if require_video_progress:
+        season, episode = latest_season, latest_episode
     if season is None or episode is None:
         return None
     size = _pick_int(getattr(latest, "size", None) if latest is not None else None) or 0
@@ -392,11 +398,11 @@ def _pick_suggestions_for_preview(
     return [item.suggestion for item in unknown_candidates[:3]]
 
 
-def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+def _search_candidates(db: Session, *, names: list[str], drive_type: str = "115", source_keys: tuple[str, ...] | None = None) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     all_items: list[dict[str, Any]] = []
     db_changed = False
     for keyword in names:
-        items, changed, _msg = fetch_task_suggestions(db, keyword=keyword, deep=1, drive_type="115")
+        items, changed, _msg = fetch_task_suggestions(db, keyword=keyword, deep=1, drive_type=drive_type, source_keys=source_keys)
         if changed:
             db_changed = True
         if isinstance(items, list):
@@ -406,7 +412,7 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
         "fetched_total": len(all_items),
         "fetched_samples": [],
         "unique_shareurl_total": 0,
-        "skip_non115": 0,
+        "skip_drive_mismatch": 0,
         "skip_tmdb_mismatch": 0,
         "kept": 0,
         "limit_reached": False,
@@ -428,8 +434,8 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
                     "datetime": str(item.get("datetime") or "").strip(),
                 }
             )
-        if AdapterRegistry.detect_drive_type(shareurl) != "115":
-            stats["skip_non115"] = int(stats.get("skip_non115") or 0) + 1
+        if AdapterRegistry.detect_drive_type(shareurl) != drive_type:
+            stats["skip_drive_mismatch"] = int(stats.get("skip_drive_mismatch") or 0) + 1
             continue
         title = str(item.get("taskname") or item.get("content") or "").strip()
         if not _title_matches_tmdb_names(title, names):
@@ -444,24 +450,68 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
     return filtered, db_changed, stats
 
 
-def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: bool = True) -> dict[str, Any]:
-    if not is_115_auto_update_task(db, task, respect_toggle=respect_toggle):
+def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: bool = True, on_update_day: bool = False) -> dict[str, Any]:
+    drive_type = "115"
+    account_name = None
+    if on_update_day:
+        source = ensure_default_sources(db)["unisearch"]
+        if not source.enabled or not _loads(source.config_json or "").get("auto_replace"):
+            return {"checked": False, "updated": False, "reason": "disabled"}
+        if str(getattr(task, "task_type", "")) != "drama" or str(getattr(task, "tmdb_media_type", "")) != "tv":
+            return {"checked": False, "updated": False, "reason": "not_applicable"}
+        drive_type = _pick_drive_type(db, task)
+        if not drive_type:
+            return {"checked": False, "updated": False, "reason": "drive_type_missing"}
+        account_name = str(getattr(task, "account_name", "") or "").strip() or None
+    elif not is_115_auto_update_task(db, task, respect_toggle=respect_toggle):
         return {"checked": False, "updated": False, "reason": "not_applicable"}
 
     tmdb_context = _load_tmdb_context(db, task)
     if tmdb_context is None:
         return {"checked": False, "updated": False, "reason": "tmdb_context_missing"}
 
+    if on_update_day:
+        today = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if not tmdb_context.weekdays or today.isoweekday() not in tmdb_context.weekdays:
+            return {"checked": False, "updated": False, "reason": "not_tmdb_update_day"}
+        enddate = str(getattr(task, "enddate", "") or "").strip()
+        if enddate and today.strftime("%Y-%m-%d") > enddate:
+            return {"checked": False, "updated": False, "reason": "task_ended"}
+        if _task_extra(task).get("allow_once"):
+            return {"checked": False, "updated": False, "reason": "once_task"}
+
     old_shareurl = str(getattr(task, "shareurl", "") or "").strip()
     if not old_shareurl:
         return {"checked": False, "updated": False, "reason": "shareurl_empty"}
 
-    current_preview_map, current_preview_changed = _preview_by_shareurl(db, [old_shareurl])
+    current_preview_map, current_preview_changed = _preview_by_shareurl(db, [old_shareurl], account_name=account_name)
     current_preview = current_preview_map.get(old_shareurl)
     current_season, current_episode = _resolve_current_progress(current_preview)
+    aired_key = None
+    if on_update_day:
+        if not current_preview or not current_preview.ok:
+            current_season, current_episode = None, None
+        snapshot = db.execute(select(TaskSavepathSnapshot).where(
+            TaskSavepathSnapshot.task_uid == str(getattr(task, "task_uid", "") or "")
+        )).scalars().first()
+        saved_season = _pick_int(getattr(snapshot, "saved_latest_season", None))
+        saved_episode = _pick_int(getattr(snapshot, "saved_latest_episode", None))
+        if saved_season and saved_episode and (current_season is None or current_episode is None or (saved_season, saved_episode) > (current_season, current_episode)):
+            current_season, current_episode = saved_season, saved_episode
+        if current_season is None or current_episode is None:
+            return {"checked": True, "updated": False, "reason": "progress_unknown", "db_changed": current_preview_changed}
+        aired = (tmdb_context.detail or {}).get("last_episode_to_air") or {}
+        aired_season, aired_episode = _pick_int(aired.get("season_number")), _pick_int(aired.get("episode_number"))
+        if aired_season and aired_episode:
+            aired_key = (aired_season, aired_episode)
+            if (current_season, current_episode) >= aired_key:
+                return {"checked": True, "updated": False, "reason": "up_to_date", "db_changed": current_preview_changed}
     tv_seasons = tmdb_context.detail.get("seasons") if isinstance(tmdb_context.detail, dict) else None
 
-    suggestions, suggestions_changed, search_stats = _search_candidates(db, names=tmdb_context.names)
+    suggestions, suggestions_changed, search_stats = _search_candidates(
+        db, names=tmdb_context.names, drive_type=drive_type,
+        source_keys=("unisearch",) if on_update_day else None,
+    )
     if not suggestions:
         logger.info(
             "[shareurl_autoupdate] no_candidates task_id=%s task_uid=%s stats=%s",
@@ -477,7 +527,7 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             "db_changed": bool(current_preview_changed or suggestions_changed),
         }
 
-    preview_suggestions = _pick_suggestions_for_preview(
+    preview_suggestions = suggestions if on_update_day else _pick_suggestions_for_preview(
         suggestions,
         current_season=current_season,
         current_episode=current_episode,
@@ -518,6 +568,7 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             for item in preview_suggestions
             if str(item.get("shareurl") or "").strip() != old_shareurl
         ],
+        account_name=account_name,
     )
 
     best: _ResolvedCandidate | None = None
@@ -539,12 +590,17 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             preview=preview_map.get(shareurl),
             fallback_season=current_season,
             tv_seasons=tv_seasons if isinstance(tv_seasons, list) else None,
+            require_video_progress=on_update_day,
         )
         if candidate is None:
             preview_stats["skip_unpreviewable"] = int(preview_stats.get("skip_unpreviewable") or 0) + 1
             continue
         preview_stats["resolved_candidates"] = int(preview_stats.get("resolved_candidates") or 0) + 1
         candidate_key = (candidate.season, candidate.episode)
+        if on_update_day:
+            expected_season = aired_key[0] if aired_key else current_season
+            if candidate.season != expected_season or (aired_key and candidate_key > aired_key):
+                continue
         if current_key is not None and candidate_key <= current_key:
             preview_stats["skip_not_higher"] = int(preview_stats.get("skip_not_higher") or 0) + 1
             continue
@@ -593,6 +649,8 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
 
     task.shareurl = new_shareurl
     task.shareurl_ban = None
+    if on_update_day:
+        task.startfid = None
     db.flush()
     logger.info(
         "[shareurl_autoupdate] task_id=%s old=%s new=%s current=S%sE%s next=S%sE%s",

@@ -19,6 +19,7 @@ from app.extensions.runtime.adapter_registry import AdapterRegistry
 from app.models.drive_account import DriveAccount
 from app.models.resource_search_source import ResourceSearchSource
 from app.services.invalid_share_links import list_invalid_shareurls
+from app.services.unisearch import DEFAULT_SERVER, UniSearchClient
 
 
 SOURCE_KEYS = ("net", "cloudsaver", "pansou", "unisearch")
@@ -188,10 +189,11 @@ def list_sources(db: Session) -> list[dict[str, Any]]:
         elif key == "pansou":
             item["server"] = cfg.get("server") or None
         elif key == "unisearch":
-            item["server"] = cfg.get("server") or None
+            item["server"] = cfg.get("server") or DEFAULT_SERVER
             item["username"] = cfg.get("username") or None
-            item["token"] = cfg.get("token") or None
             item["password"] = None
+            item["auto_replace"] = bool(cfg.get("auto_replace"))
+            item["has_password"] = bool(cfg.get("password"))
         out.append(item)
     return out
 
@@ -230,6 +232,19 @@ def update_source(db: Session, key: str, payload: dict[str, Any]) -> ResourceSea
             pw = str(payload["password"] or "")
             if pw.strip():
                 cfg["password"] = pw
+        cfg["server"] = cfg.get("server") or DEFAULT_SERVER
+        if "auto_replace" in payload and payload["auto_replace"] is not None:
+            cfg["auto_replace"] = bool(payload["auto_replace"])
+        if row.enabled:
+            if not str(cfg["server"]).startswith("https://"):
+                raise bad_request("UNISEARCH_SERVER_INVALID", "UniSearch 服务器必须使用 HTTPS")
+            client = UniSearchClient(cfg["server"], username=cfg.get("username") or "", password=cfg.get("password") or "")
+            try:
+                cfg["token"] = client.login()
+            except (requests.RequestException, ValueError):
+                raise bad_request("UNISEARCH_LOGIN_FAILED", "UniSearch 登录失败，请检查账号密码或网站状态") from None
+            finally:
+                client.close()
         row.config_json = _dumps(cfg)
         db.flush()
         return row
@@ -466,121 +481,14 @@ class PanSouClient:
         return out
 
 
-class UniSearchClient:
-    """UniSearch（PanSou 魔改 + 鉴权）客户端"""
-
-    DRIVE_TYPE_TO_CLOUD = {
-        "quark": "quark",
-        "baidu": "baidu",
-        "aliyun": "aliyun",
-        "cloud189": "tianyi",
-        "tianyi": "tianyi",
-        "uc": "uc",
-        "115": "115",
-        "pan115": "115",
-        "cloud115": "115",
-        "xunlei": "xunlei",
-        "123pan": "123",
-        "pan123": "123",
-    }
-    ALL_CLOUD_TYPES = ["quark", "baidu", "aliyun", "tianyi", "uc", "115", "xunlei", "123"]
-
-    def __init__(self, server: str):
-        self.server = server.rstrip("/")
-        self.session = requests.Session()
-        self.username = ""
-        self.password = ""
-        self.token = ""
-
-    def set_auth(self, username: str, password: str, token: str = "") -> None:
-        self.username = username
-        self.password = password
-        self.token = token
-        if token:
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
-        else:
-            self.session.headers.pop("Authorization", None)
-
-    def login(self) -> str:
-        url = f"{self.server}/api/auth/login"
-        res = self.session.post(
-            url,
-            json={"username": self.username, "password": self.password},
-            timeout=EXTERNAL_TIMEOUT,
-        )
-        data = res.json() if res.status_code == 200 else {}
-        if data.get("code") in (0, 200):
-            token = str(((data.get("data") or {}).get("access_token")) or "")
-            if token:
-                self.token = token
-                self.session.headers.update({"Authorization": f"Bearer {token}"})
-            return token
-        return ""
-
-    def _cloud_types(self, drive_type: str | None) -> list[str]:
-        if not drive_type:
-            return list(self.ALL_CLOUD_TYPES)
-        cloud = self.DRIVE_TYPE_TO_CLOUD.get(str(drive_type).strip())
-        return [cloud] if cloud else list(self.ALL_CLOUD_TYPES)
-
-    def _search_once(self, keyword: str, cloud_types: list[str], refresh: bool) -> dict[str, Any]:
-        url = f"{self.server}/api/search"
-        res = self.session.post(
-            url,
-            json={"kw": keyword, "cloud_types": cloud_types, "src": "all", "res": "merge", "refresh": bool(refresh)},
-            timeout=EXTERNAL_TIMEOUT,
-        )
-        if res.status_code == 401:
-            return {"code": 401}
-        data = res.json()
-        return data if isinstance(data, dict) else {}
-
-    def search(self, keyword: str, refresh: bool = False, *, drive_type: str | None = None) -> tuple[list[dict[str, Any]], str | None]:
-        """返回 (统一格式结果, 新token|None)；401 时自动重登一次"""
-        cloud_types = self._cloud_types(drive_type)
-        data = self._search_once(keyword, cloud_types, refresh)
-        new_token: str | None = None
-        if data.get("code") == 401:
-            token = self.login()
-            if not token:
-                return ([], None)
-            new_token = token
-            data = self._search_once(keyword, cloud_types, refresh)
-        if data.get("code") not in (0, 200):
-            return ([], new_token)
-        resources = ((data.get("data") or {}).get("resources")) or []
-        return (self.format_search_results(resources), new_token)
-
-    def format_search_results(self, resources: Any) -> list[dict[str, Any]]:
-        if not isinstance(resources, list):
-            return []
-        out: list[dict[str, Any]] = []
-        link_set: set[str] = set()
-        for resource in resources:
-            if not isinstance(resource, dict):
-                continue
-            src = resource.get("source") if isinstance(resource.get("source"), dict) else {}
-            channel = str(src.get("channel") or src.get("name") or "")
-            title = str(resource.get("title") or resource.get("name") or "")
-            description = str(resource.get("description") or "")
-            for link in resource.get("links") or []:
-                if not isinstance(link, dict):
-                    continue
-                url = str(link.get("url") or "").strip()
-                if not url or url in link_set:
-                    continue
-                link_set.add(url)
-                out.append(
-                    {
-                        "shareurl": url,
-                        "taskname": title,
-                        "content": description,
-                        "datetime": _unisearch_to_cst(str(link.get("datetime") or "")),
-                        "channel": channel,
-                        "source": "UniSearch",
-                    }
-                )
-        return out
+def _unisearch_cloud_type(value: str | None) -> str | None:
+    dt = _normalize_drive_type(value)
+    if not dt:
+        return None
+    return {
+        "115": "pan115", "123pan": "pan123", "cloud189": "tianyi", "baidu": "baidu",
+        "quark": "quark", "uc": "uc", "aliyun": "aliyun", "xunlei": "xunlei",
+    }.get(dt, dt)
 
 
 def _unisearch_to_cst(value: str) -> str:
@@ -606,6 +514,7 @@ def fetch_task_suggestions(
     *,
     filter_invalid: bool = True,
     drive_type: str | None = None,
+    source_keys: tuple[str, ...] | None = None,
 ) -> tuple[list[dict[str, Any]], bool, str | None]:
     keyword = str(keyword or "").strip()
     if len(keyword) < 2:
@@ -619,6 +528,7 @@ def fetch_task_suggestions(
     cfg_cs = _loads(rows["cloudsaver"].config_json or "")
     cfg_ps = _loads(rows["pansou"].config_json or "")
     cfg_us = _loads(rows["unisearch"].config_json or "") if "unisearch" in rows else {}
+    selected_sources = set(source_keys or SOURCE_KEYS)
     _log_debug(
         "[suggestions] sources",
         {
@@ -639,7 +549,7 @@ def fetch_task_suggestions(
                         continue
                     out.append(item)
                 return out
-            if not rows["net"].enabled:
+            if "net" not in selected_sources or not rows["net"].enabled:
                 return []
             base_url = base64.b64decode("aHR0cHM6Ly9wYW5zZWFyY2guMTIzY2YudG9w").decode()
             url = f"{base_url}/task_suggestions"
@@ -655,7 +565,7 @@ def fetch_task_suggestions(
 
     def cs_search():
         try:
-            if not rows["cloudsaver"].enabled:
+            if "cloudsaver" not in selected_sources or not rows["cloudsaver"].enabled:
                 return ([], None)
             server = str(cfg_cs.get("server") or "").strip()
             username = str(cfg_cs.get("username") or "").strip()
@@ -678,7 +588,7 @@ def fetch_task_suggestions(
 
     def ps_search():
         try:
-            if not rows["pansou"].enabled:
+            if "pansou" not in selected_sources or not rows["pansou"].enabled:
                 return []
             server = str(cfg_ps.get("server") or "").strip()
             if not server:
@@ -689,24 +599,27 @@ def fetch_task_suggestions(
             return []
 
     def us_search():
-        try:
-            if "unisearch" not in rows or not rows["unisearch"].enabled:
-                return ([], None)
-            server = str(cfg_us.get("server") or "").strip()
-            username = str(cfg_us.get("username") or "").strip()
-            password = str(cfg_us.get("password") or "")
-            token = str(cfg_us.get("token") or "")
-            if not (server and username and password):
-                return ([], None)
-            us = UniSearchClient(server)
-            us.set_auth(username=username, password=password, token=token)
-            return us.search(keyword.lower(), refresh=deep == 1, drive_type=dt_filter)
-        except Exception:
+        if "unisearch" not in selected_sources or not rows["unisearch"].enabled:
             return ([], None)
+        client = UniSearchClient(
+            str(cfg_us.get("server") or DEFAULT_SERVER),
+            username=str(cfg_us.get("username") or ""), password=str(cfg_us.get("password") or ""),
+            token=str(cfg_us.get("token") or ""),
+        )
+        try:
+            items = client.search(keyword, cloud_type=_unisearch_cloud_type(dt_filter), refresh=deep == 1)
+            for item in items:
+                item["datetime"] = _unisearch_to_cst(item.get("datetime") or "")
+            return (items, client.token)
+        except (requests.RequestException, ValueError):
+            source_errors.append("UniSearch 搜索失败，请检查账号密码或网站状态")
+            return ([], None)
+        finally:
+            client.close()
 
     search_results: list[dict[str, Any]] = []
-    new_token: str | None = None
-    new_token_source: str | None = None
+    new_tokens: dict[str, str] = {}
+    source_errors: list[str] = []
 
     def _tag(src: str, fn):
         def wrapper():
@@ -728,8 +641,7 @@ def fetch_task_suggestions(
             if isinstance(r, tuple):
                 items, tok = r
                 if tok:
-                    new_token = str(tok)
-                    new_token_source = src
+                    new_tokens[src] = str(tok)
                 if isinstance(items, list):
                     search_results.extend([x for x in items if isinstance(x, dict)])
                 continue
@@ -752,12 +664,15 @@ def fetch_task_suggestions(
         results.append(item)
 
     token_updated = False
-    if new_token and new_token_source in ("cloudsaver", "unisearch") and new_token_source in rows:
-        src_cfg = _loads(rows[new_token_source].config_json or "")
-        src_cfg["token"] = new_token
-        rows[new_token_source].config_json = _dumps(src_cfg)
-        db.flush()
-        token_updated = True
+    for source_key, token in new_tokens.items():
+        if source_key not in ("cloudsaver", "unisearch"):
+            continue
+        src_cfg = _loads(rows[source_key].config_json or "")
+        if token != src_cfg.get("token"):
+            src_cfg["token"] = token
+            rows[source_key].config_json = _dumps(src_cfg)
+            db.flush()
+            token_updated = True
 
     enabled_drive_types = set(
         str(x or "").strip()
@@ -793,7 +708,7 @@ def fetch_task_suggestions(
         filtered.append(item)
 
     message = None
-    msg_parts: list[str] = []
+    msg_parts: list[str] = source_errors[:]
     if dt_filter:
         msg_parts.append(f"已限定网盘类型：{dt_filter}")
     elif removed_by_accounts:

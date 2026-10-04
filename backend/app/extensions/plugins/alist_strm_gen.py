@@ -178,17 +178,21 @@ class Alist_strm_gen:
             ).replace("\\", "/")
 
         configured_root = self._norm_path(self.root_dir) if str(self.root_dir or "").strip() else ""
-        if configured_root and savepath.startswith(configured_root):
+        if configured_root:
+            if savepath != configured_root and not savepath.startswith(configured_root.rstrip("/") + "/"):
+                return None
             candidate = join_mount(savepath.replace(configured_root, "", 1))
             if self._path_exists(candidate):
                 return candidate
+            logger.warning("Alist-Strm生成: 任务目录不可用 %s", candidate)
+            return None
 
         candidate = join_mount(savepath)
         if self._path_exists(candidate):
             return candidate
 
         segments = [s for s in savepath.split("/") if s]
-        for k in range(len(segments), 0, -1):
+        for k in range(1, len(segments)):
             prefix = "/" + "/".join(segments[:k])
             rel = "/" + "/".join(segments[k:])
             candidate = join_mount(rel)

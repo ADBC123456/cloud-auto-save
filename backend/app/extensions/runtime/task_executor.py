@@ -280,6 +280,22 @@ class TaskExecutor:
 
         try:
             autoupdate_db_changed = False
+            if str(task_data.get("task_type") or "") == "drama":
+                try:
+                    update_result = resolve_drama_shareurl_update(self.db, task, on_update_day=True)
+                    autoupdate_db_changed = bool(update_result.get("db_changed"))
+                    if update_result.get("checked"):
+                        log.set_stage("shareurl_autoupdate_before")
+                        log.section("更新日自动换源")
+                        if update_result.get("updated"):
+                            task_data["shareurl"] = task.shareurl
+                            task_data["startfid"] = task.startfid
+                            log.line(f"OK: 已换源 S{update_result.get('season')}E{update_result.get('episode')} {task.shareurl}")
+                        else:
+                            log.line(f"跳过: {update_result.get('reason')}")
+                except Exception as exc:
+                    logger.warning("更新日自动换源失败 task_id=%s error_type=%s", task_id, type(exc).__name__)
+                    log.line("WARN: 自动换源检查失败，保留原分享链接")
             if getattr(task, "shareurl_ban", None):
                 log.set_stage("shareurl_ban")
                 log.section("任务封禁")
@@ -322,7 +338,13 @@ class TaskExecutor:
                     if not has_new_files:
                         log.set_stage("plugin_run")
                         log.section("插件执行")
-                        log.line("跳过: 本次无新增文件")
+                        log.line("本次无新增文件，仅刷新 OpenList 和 Emby")
+                        plugins = [
+                            item for item in PluginRegistry(self.db).load_active_plugins()
+                            if getattr(item.get("definition"), "plugin_key", "") in {"openlist", "emby"}
+                        ]
+                        plugins.sort(key=lambda item: getattr(item.get("definition"), "plugin_key", "") == "emby")
+                        task_data = PluginHookRunner.run(plugins, task_data, adapter, tree, emit_line=log.line)
                     else:
                         registry = PluginRegistry(self.db)
                         log.set_stage("load_plugins")
@@ -399,7 +421,7 @@ class TaskExecutor:
                 log.section("自动换链")
                 try:
                     update_result = resolve_drama_shareurl_update(self.db, task, respect_toggle=True)
-                    autoupdate_db_changed = bool(update_result.get("db_changed"))
+                    autoupdate_db_changed = autoupdate_db_changed or bool(update_result.get("db_changed"))
                     if bool(update_result.get("updated")):
                         season = update_result.get("season")
                         episode = update_result.get("episode")

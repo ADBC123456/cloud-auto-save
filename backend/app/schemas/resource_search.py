@@ -10,6 +10,8 @@ class ResourceSearchSourceItemOut(BaseModel):
     username: str | None = Field(default=None, max_length=256)
     password: str | None = Field(default=None, max_length=256)
     token: str | None = Field(default=None, max_length=2048)
+    auto_replace: bool = False
+    has_password: bool = False
 
 
 class ResourceSearchSourceListOut(BaseModel):
@@ -22,6 +24,7 @@ class ResourceSearchSourceUpdateIn(BaseModel):
     username: str | None = Field(default=None, max_length=256)
     password: str | None = Field(default=None, max_length=256)
     token: str | None = Field(default=None, max_length=2048)
+    auto_replace: bool | None = None
 
 
 class TaskSuggestionItemOut(BaseModel):

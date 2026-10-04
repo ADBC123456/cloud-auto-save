@@ -7,6 +7,8 @@ export type ResourceSearchSourceItem = {
   username?: string | null
   password?: string | null
   token?: string | null
+  auto_replace?: boolean
+  has_password?: boolean
 }
 
 export type ResourceSearchSourceListResponse = {
