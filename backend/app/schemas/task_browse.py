@@ -49,6 +49,7 @@ class SharePreviewOut(BaseModel):
 class SharePreviewBatchIn(BaseModel):
     shareurls: list[str] = Field(min_length=1, max_length=50)
     account_name: str | None = Field(default=None, max_length=128)
+    refresh: bool = False
 
 
 class SharePreviewBatchLatestOut(BaseModel):

@@ -190,6 +190,130 @@ def test_existing_115_toggle_still_applies(db, drama):
     assert result["reason"] == "not_applicable"
 
 
+@pytest.mark.parametrize("saved_episode", [None, 8, 10])
+def test_failed_share_recovers_outside_update_day_and_once_runs(db, drama, monkeypatch, saved_episode):
+    task, snapshot, context = drama
+    context.weekdays = []
+    snapshot.saved_latest_episode = saved_episode
+    task.extra_json = json.dumps({"allow_once": True})
+    new = "https://pan.quark.cn/s/new"
+    install_search(monkeypatch, [{"taskname": "Example S01E10", "shareurl": new}], {new: preview(new, 10)}, old_ok=False)
+    result = updates.resolve_drama_shareurl_update(db, task, on_share_failure=True)
+    assert result["updated"] and task.shareurl == new and task.startfid is None
+
+
+@pytest.mark.parametrize("episode,ok,season", [(7, True, 1), (None, True, 1), (10, False, 1), (10, True, 2), (11, True, 1)])
+def test_failed_share_still_rejects_older_unreadable_and_wrong_season_candidates(db, drama, monkeypatch, episode, ok, season):
+    task, _, _ = drama
+    new = "https://pan.quark.cn/s/new"
+    install_search(monkeypatch, [{"taskname": "Example S01E10", "shareurl": new}], {new: preview(new, episode, ok=ok, season=season)}, old_ok=False)
+    result = updates.resolve_drama_shareurl_update(db, task, on_share_failure=True)
+    assert not result["updated"]
+    assert task.shareurl.endswith("/old")
+
+
+def test_failed_share_recovery_respects_disabled_setting(db, drama, monkeypatch):
+    task, _, _ = drama
+    search.ensure_default_sources(db)["unisearch"].config_json = "{}"
+    fetch = Mock()
+    monkeypatch.setattr(updates, "fetch_task_suggestions", fetch)
+    result = updates.resolve_drama_shareurl_update(db, task, on_share_failure=True)
+    assert result["reason"] == "disabled"
+    fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("title", [
+    "我不是大师 全24集 [2026][4K]",
+    "我不是大师 (2026) 4K 全24集 已完结",
+    "我不是大师（2026）4K 60FPS S01 杜比音效",
+    "我不是大师（2026）4K 10bit 60FPS 杜比环绕声 更至EP24",
+])
+def test_release_metadata_does_not_hide_the_matching_series(title):
+    assert updates._title_matches_tmdb_names(title, ["我不是大师"])
+
+
+@pytest.mark.parametrize("title", ["我不是大师兄 全24集 [2026][4K]", "大师 全24集 [2026][4K]"])
+def test_release_metadata_matching_still_rejects_different_series(title):
+    assert not updates._title_matches_tmdb_names(title, ["我不是大师"])
+
+
+def test_latest_episode_wins_over_file_modification_time(monkeypatch):
+    from app.services.share_preview_batch import _auto_resolve_latest_video
+    monkeypatch.setattr("app.services.share_preview_batch.guessit_episode_numbers", lambda name, **kwargs: {
+        "S01E23.mp4": (1, 23), "S01E24.mp4": (1, 24),
+    }[name])
+    adapter = Mock()
+    adapter.get_detail.return_value = {"code": 0, "data": {"list": [
+        {"fid": "23", "file_name": "S01E23.mp4", "updated_at": 1791111176},
+        {"fid": "24", "file_name": "S01E24.mp4", "updated_at": 1791011176},
+    ]}}
+    _, latest = _auto_resolve_latest_video(adapter, "share", "token", "folder")
+    assert latest["name"] == "S01E24.mp4"
+
+
+def test_preview_rejects_api_errors_instead_of_reporting_empty_success():
+    from app.services.share_preview_batch import _auto_resolve_latest_video
+    adapter = Mock()
+    adapter.get_detail.return_value = {"status": 400, "code": -7, "message": "分享文件夹等待审核中", "data": {"list": []}}
+    with pytest.raises(RuntimeError, match="等待审核"):
+        _auto_resolve_latest_video(adapter, "share", "token", "folder")
+
+
+def test_movie_preview_keeps_modification_time_order(monkeypatch):
+    from app.services.share_preview_batch import _auto_resolve_latest_video
+    monkeypatch.setattr("app.services.share_preview_batch.guessit_episode_numbers", lambda *_args, **_kwargs: (None, None))
+    adapter = Mock()
+    adapter.get_detail.return_value = {"code": 0, "data": {"list": [
+        {"fid": "old", "file_name": "Movie.mp4", "updated_at": 1791011176},
+        {"fid": "new", "file_name": "Movie.mkv", "updated_at": 1791111176},
+    ]}}
+    _, latest = _auto_resolve_latest_video(adapter, "share", "token", "folder")
+    assert latest["fid"] == "new"
+
+
+def test_waiting_for_review_is_not_permanently_blacklisted():
+    from app.services.share_preview_batch import _should_persist_invalid_share_link
+    assert not _should_persist_invalid_share_link("get_detail status=400 errno=-7: 分享文件夹等待审核中")
+    assert _should_persist_invalid_share_link("文件不存在或已被删除")
+
+
+@pytest.mark.parametrize("second_failure", [False, True])
+def test_share_failure_retries_new_source_once_within_same_execution(db, drama, monkeypatch, second_failure):
+    from app.extensions.runtime.task_executor import TaskExecutor
+    from app.extensions.runtime.execution_log import ExecutionLog
+    import app.extensions.runtime.task_executor as runtime
+
+    task, _, context = drama
+    context.weekdays = []
+    new = "https://pan.quark.cn/s/new"
+    fetch = install_search(monkeypatch, [{"taskname": "Example S01E10", "shareurl": new}], {new: preview(new, 10)}, old_ok=False)
+    log = ExecutionLog()
+    tree = Tree()
+    tree.create_node("Example", "root")
+    attempts = []
+
+    def execute(instance):
+        attempts.append(instance.task_data["shareurl"])
+        log.set_stage("fetch_share_items")
+        if len(attempts) == 1 or second_failure:
+            raise RuntimeError("get_detail status=400 errno=-7")
+        instance.transfer_count = 1
+        return tree
+
+    monkeypatch.setattr(runtime.DramaTaskExecutor, "execute", execute)
+    executor = TaskExecutor(db)
+    data = executor._task_to_dict(task)
+    if second_failure:
+        with pytest.raises(RuntimeError, match="errno=-7"):
+            executor._execute_drama_task(Mock(), data, log, task=task)
+    else:
+        result = executor._execute_drama_task(Mock(), data, log, task=task)
+        assert result._transfer_count == 1
+    assert attempts == ["https://pan.quark.cn/s/old", new]
+    fetch.assert_called_once()
+    assert "分享失败自动换源" in log.render()
+
+
 def test_source_integration_filters_unavailable_drives(db, drama, monkeypatch):
     monkeypatch.setattr(UniSearchClient, "search", lambda *_args, **_kwargs: [
         {"taskname": "Example", "shareurl": "https://pan.quark.cn/s/new"},

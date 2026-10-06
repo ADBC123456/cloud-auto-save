@@ -95,9 +95,49 @@ class TaskExecutor:
             tree.create_node(str(name), node_id, parent='root')
         return tree
 
-    def _execute_drama_task(self, adapter: Any, task_data: dict[str, Any], log: ExecutionLog | None) -> Tree:
+    def _recover_drama_share(self, task: Task, task_data: dict[str, Any], log: ExecutionLog) -> bool:
+        if task_data.get("_share_recovery_attempted"):
+            log.line("跳过: 本次执行已尝试换源，不重复搜索")
+            return False
+        task_data["_share_recovery_attempted"] = True
+        log.section("分享失败自动换源")
+        try:
+            result = resolve_drama_shareurl_update(self.db, task, on_share_failure=True)
+        except Exception as exc:
+            logger.warning("分享失败换源检查异常 task_id=%s error_type=%s", task.id, type(exc).__name__)
+            log.line("WARN: 换源检查失败，保留原任务")
+            return False
+        if not result.get("updated"):
+            reasons = {
+                "disabled": "未启用 UniSearch 自动换源", "tmdb_context_missing": "缺少 TMDB 匹配信息",
+                "not_applicable": "任务未绑定 TMDB 电视剧条目", "drive_type_missing": "无法确定任务网盘类型",
+                "no_candidates": "未找到同剧且匹配网盘的候选资源",
+                "no_better_candidate": "候选资源不可用，或实际集数不足",
+            }
+            log.line("未换源: " + reasons.get(result.get("reason"), str(result.get("reason") or "未找到可用资源")))
+            detail = result.get("reason_detail") or {}
+            if detail:
+                counts = {key: {k: v for k, v in value.items() if k != "fetched_samples"} if isinstance(value, dict) else value for key, value in detail.items()}
+                log.line("候选检查: " + json.dumps(counts, ensure_ascii=False))
+            return False
+        task_data["shareurl"] = task.shareurl
+        task_data["startfid"] = task.startfid
+        log.line(f"OK: 已换源 S{result.get('season')}E{result.get('episode')} {task.shareurl}")
+        log.line("继续执行: 使用新分享链接重试一次")
+        return True
+
+    def _execute_drama_task(self, adapter: Any, task_data: dict[str, Any], log: ExecutionLog | None, *, task: Task | None = None) -> Tree:
         executor = DramaTaskExecutor(adapter=adapter, task_data=task_data, log=log)
-        tree = executor.execute()
+        try:
+            tree = executor.execute()
+        except Exception as exc:
+            if isinstance(exc, SkipTask) or task is None or log is None or log.stage not in {"share_parse", "get_stoken", "fetch_share_items"}:
+                raise
+            log.line(f"原分享读取失败: {str(exc)}")
+            if not self._recover_drama_share(task, task_data, log):
+                raise
+            executor = DramaTaskExecutor(adapter=adapter, task_data=task_data, log=log)
+            tree = executor.execute()
         try:
             setattr(tree, "_transfer_count", int(getattr(executor, "transfer_count", 0) or 0))
         except Exception:
@@ -297,6 +337,9 @@ class TaskExecutor:
                     logger.warning("更新日自动换源失败 task_id=%s error_type=%s", task_id, type(exc).__name__)
                     log.line("WARN: 自动换源检查失败，保留原分享链接")
             if getattr(task, "shareurl_ban", None):
+                if str(task_data.get("task_type") or "") == "drama":
+                    self._recover_drama_share(task, task_data, log)
+            if getattr(task, "shareurl_ban", None):
                 log.set_stage("shareurl_ban")
                 log.section("任务封禁")
                 log.line(f"跳过: {str(getattr(task, 'shareurl_ban', '') or '').strip()}")
@@ -309,7 +352,7 @@ class TaskExecutor:
             if task_data.get('task_type') == 'drama':
                 log.set_stage("execute_drama")
                 log.section("转存任务")
-                tree = self._execute_drama_task(adapter, task_data, log)
+                tree = self._execute_drama_task(adapter, task_data, log, task=task)
             else:
                 log.set_stage("execute_generic")
                 log.section("转存任务")

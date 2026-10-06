@@ -15,6 +15,8 @@ from app.core.settings import settings
 from app.db.session import SessionLocal
 from app.extensions.runtime.account_manager import DatabaseAccountManager
 from app.extensions.runtime.adapter_registry import AdapterRegistry
+from app.extensions.runtime.drama_executor import DramaTaskExecutor
+from app.extensions.runtime.guessit_fallback import guessit_episode_numbers
 from app.models.drive_account import DriveAccount
 from app.schemas.task_browse import SharePreviewBatchIn, SharePreviewBatchItemOut, SharePreviewBatchOut
 from app.services.invalid_share_links import upsert_invalid_share_link
@@ -85,6 +87,8 @@ def _should_persist_invalid_share_link(message: str | None) -> bool:
     if "cookie" in lowered and any(x in msg for x in ("失效", "过期", "被限流", "限流")):
         return False
     if any(x in msg for x in ("被限流", "限流")) or any(x in lowered for x in ("rate limit", "ratelimit", "too many requests")):
+        return False
+    if any(x in msg for x in ("等待审核", "网页访问验证", "无法解析百度分享页面", "errno=115")):
         return False
     return True
 
@@ -179,13 +183,17 @@ def _to_ts(v):
 def _auto_resolve_latest_video(adapter, pwd_id: str, stoken: str, start_fid: str) -> tuple[str, dict | None]:
     current_fid = str(start_fid or "").strip()
     latest: dict | None = None
+    reader = DramaTaskExecutor(adapter=adapter, task_data={})
     for _depth in range(10):
-        detail = adapter.get_detail(pwd_id, stoken, current_fid)
-        raw_items = (((detail or {}).get("data") or {}).get("list")) or []
+        raw_items = reader._fetch_share_items(pwd_id=pwd_id, stoken=stoken, pdir_fid=current_fid)
         files = [x for x in raw_items if not _bool_is_dir(x)]
         videos = [x for x in files if _is_video_name(_pick_name(x))]
         if videos:
-            videos.sort(key=lambda x: _to_ts(_pick_updated_at(x)) or 0, reverse=True)
+            def video_progress(item):
+                season, episode = guessit_episode_numbers(_pick_name(item), trace_tag="preview_batch")
+                return (int(season or 0), int(episode or 0), _to_ts(_pick_updated_at(item)) or 0)
+
+            videos.sort(key=video_progress, reverse=True)
             hit = videos[0]
             latest = {
                 "fid": _pick_fid(hit) or None,
@@ -244,12 +252,12 @@ def preview_share_batch(db: Session, payload: SharePreviewBatchIn) -> tuple[Shar
     per_drive: dict[str, list[str]] = {}
     items: list[SharePreviewBatchItemOut] = []
     for url in shareurls:
-        cached = _share_preview_batch_cache_get(shareurl=url)
+        cached = None if payload.refresh else _share_preview_batch_cache_get(shareurl=url)
         if cached is not None:
             items.append(cached)
             continue
         try:
-            row, hit_changed = _short_tx(lambda s: get_cached_preview_batch_item(s, shareurl=url))
+            row, hit_changed = (None, False) if payload.refresh else _short_tx(lambda s: get_cached_preview_batch_item(s, shareurl=url))
         except Exception:
             row, hit_changed = (None, False)
         if row is not None:

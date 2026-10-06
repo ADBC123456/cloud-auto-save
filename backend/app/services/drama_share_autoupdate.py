@@ -32,6 +32,12 @@ _RE_NOISE_TOKEN = re.compile(
     r"\b(?:4k|8k|2160p|1080p|720p|bluray|bdrip|web-?dl|webrip|hdtv|x264|x265|h\.?264|h\.?265|hevc|aac|dts|uhd)\b",
     re.IGNORECASE,
 )
+_RE_RELEASE_METADATA = re.compile(
+    r"(?:全|共|更新(?:至)?|更至)\s*(?:EP)?\d{1,4}\s*集?"
+    r"|已完结|杜比(?:音效|环绕声)|简体字幕|去头去尾"
+    r"|\b(?:S\d{1,3}|HDR|SDR|DV|DDP\d(?:\.\d)?|\d+(?:fps|bit))\b",
+    re.IGNORECASE,
+)
 _RE_EMOJI = re.compile(
     r"[\U0001F1E6-\U0001F1FF]"
     r"|[\U0001F300-\U0001F5FF]"
@@ -226,6 +232,7 @@ def _cleanup_title_subject(value: str) -> str:
     text = _RE_SEASON_EPISODE.sub(" ", text)
     text = _RE_EPISODE_ONLY.sub(" ", text)
     text = _RE_NOISE_TOKEN.sub(" ", text)
+    text = _RE_RELEASE_METADATA.sub(" ", text)
     text = re.sub(r"[\(\[（【].*?[\)\]）】]", " ", text)
     text = re.sub(r"[:：\-_.,]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -266,10 +273,10 @@ def _title_matches_tmdb_names(title: str, names: list[str]) -> bool:
     return False
 
 
-def _preview_by_shareurl(db: Session, shareurls: list[str], *, account_name: str | None = None) -> tuple[dict[str, SharePreviewBatchItemOut], bool]:
+def _preview_by_shareurl(db: Session, shareurls: list[str], *, account_name: str | None = None, refresh: bool = False) -> tuple[dict[str, SharePreviewBatchItemOut], bool]:
     if not shareurls:
         return {}, False
-    out, changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=shareurls, account_name=account_name))
+    out, changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=shareurls, account_name=account_name, refresh=refresh))
     mapping: dict[str, SharePreviewBatchItemOut] = {}
     for row in out.items or []:
         url = str(getattr(row, "shareurl", "") or "").strip()
@@ -450,10 +457,11 @@ def _search_candidates(db: Session, *, names: list[str], drive_type: str = "115"
     return filtered, db_changed, stats
 
 
-def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: bool = True, on_update_day: bool = False) -> dict[str, Any]:
+def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: bool = True, on_update_day: bool = False, on_share_failure: bool = False) -> dict[str, Any]:
+    use_unisearch = on_update_day or on_share_failure
     drive_type = "115"
     account_name = None
-    if on_update_day:
+    if use_unisearch:
         source = ensure_default_sources(db)["unisearch"]
         if not source.enabled or not _loads(source.config_json or "").get("auto_replace"):
             return {"checked": False, "updated": False, "reason": "disabled"}
@@ -484,11 +492,12 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
     if not old_shareurl:
         return {"checked": False, "updated": False, "reason": "shareurl_empty"}
 
-    current_preview_map, current_preview_changed = _preview_by_shareurl(db, [old_shareurl], account_name=account_name)
+    # A failed execution already established that this link cannot be read.
+    current_preview_map, current_preview_changed = ({}, False) if on_share_failure else _preview_by_shareurl(db, [old_shareurl], account_name=account_name)
     current_preview = current_preview_map.get(old_shareurl)
     current_season, current_episode = _resolve_current_progress(current_preview)
     aired_key = None
-    if on_update_day:
+    if use_unisearch:
         if not current_preview or not current_preview.ok:
             current_season, current_episode = None, None
         snapshot = db.execute(select(TaskSavepathSnapshot).where(
@@ -498,19 +507,19 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
         saved_episode = _pick_int(getattr(snapshot, "saved_latest_episode", None))
         if saved_season and saved_episode and (current_season is None or current_episode is None or (saved_season, saved_episode) > (current_season, current_episode)):
             current_season, current_episode = saved_season, saved_episode
-        if current_season is None or current_episode is None:
+        if not on_share_failure and (current_season is None or current_episode is None):
             return {"checked": True, "updated": False, "reason": "progress_unknown", "db_changed": current_preview_changed}
         aired = (tmdb_context.detail or {}).get("last_episode_to_air") or {}
         aired_season, aired_episode = _pick_int(aired.get("season_number")), _pick_int(aired.get("episode_number"))
         if aired_season and aired_episode:
             aired_key = (aired_season, aired_episode)
-            if (current_season, current_episode) >= aired_key:
+            if not on_share_failure and (current_season, current_episode) >= aired_key:
                 return {"checked": True, "updated": False, "reason": "up_to_date", "db_changed": current_preview_changed}
     tv_seasons = tmdb_context.detail.get("seasons") if isinstance(tmdb_context.detail, dict) else None
 
     suggestions, suggestions_changed, search_stats = _search_candidates(
         db, names=tmdb_context.names, drive_type=drive_type,
-        source_keys=("unisearch",) if on_update_day else None,
+        source_keys=("unisearch",) if use_unisearch else None,
     )
     if not suggestions:
         logger.info(
@@ -527,7 +536,7 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             "db_changed": bool(current_preview_changed or suggestions_changed),
         }
 
-    preview_suggestions = suggestions if on_update_day else _pick_suggestions_for_preview(
+    preview_suggestions = suggestions if use_unisearch else _pick_suggestions_for_preview(
         suggestions,
         current_season=current_season,
         current_episode=current_episode,
@@ -569,6 +578,7 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             if str(item.get("shareurl") or "").strip() != old_shareurl
         ],
         account_name=account_name,
+        refresh=on_share_failure,
     )
 
     best: _ResolvedCandidate | None = None
@@ -590,18 +600,18 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             preview=preview_map.get(shareurl),
             fallback_season=current_season,
             tv_seasons=tv_seasons if isinstance(tv_seasons, list) else None,
-            require_video_progress=on_update_day,
+            require_video_progress=use_unisearch,
         )
         if candidate is None:
             preview_stats["skip_unpreviewable"] = int(preview_stats.get("skip_unpreviewable") or 0) + 1
             continue
         preview_stats["resolved_candidates"] = int(preview_stats.get("resolved_candidates") or 0) + 1
         candidate_key = (candidate.season, candidate.episode)
-        if on_update_day:
+        if use_unisearch:
             expected_season = aired_key[0] if aired_key else current_season
-            if candidate.season != expected_season or (aired_key and candidate_key > aired_key):
+            if (expected_season is not None and candidate.season != expected_season) or (aired_key and candidate_key > aired_key):
                 continue
-        if current_key is not None and candidate_key <= current_key:
+        if current_key is not None and (candidate_key < current_key or (candidate_key == current_key and not on_share_failure)):
             preview_stats["skip_not_higher"] = int(preview_stats.get("skip_not_higher") or 0) + 1
             continue
         sort_key = (
@@ -649,7 +659,7 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
 
     task.shareurl = new_shareurl
     task.shareurl_ban = None
-    if on_update_day:
+    if use_unisearch:
         task.startfid = None
     db.flush()
     logger.info(
