@@ -183,6 +183,12 @@ class TaskExecutor:
             account_manager = DatabaseAccountManager(self.db)
         task_data = self._task_to_dict(task)
         try:
+            from app.services.media_library import apply_category_to_task_data
+
+            apply_category_to_task_data(self.db, task_data)
+        except Exception:
+            logger.exception("媒体库分类: 补齐插件参数失败 task=%s", task_data.get("taskname"))
+        try:
             from app.services.magic_regex import get_enabled_magic_regex_map
 
             task_data["magic_regex"] = get_enabled_magic_regex_map(self.db)

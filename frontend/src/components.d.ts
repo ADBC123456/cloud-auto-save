@@ -72,6 +72,7 @@ declare module 'vue' {
     ElTree: typeof import('element-plus/es')['ElTree']
     HelloWorld: typeof import('./components/HelloWorld.vue')['default']
     InteractiveLineChart: typeof import('./components/dashboard/InteractiveLineChart.vue')['default']
+    MediaLibraryPanel: typeof import('./components/settings/MediaLibraryPanel.vue')['default']
     NotificationChannelCard: typeof import('./components/extensions/NotificationChannelCard.vue')['default']
     NotificationChannelDrawer: typeof import('./components/extensions/NotificationChannelDrawer.vue')['default']
     PluginCard: typeof import('./components/extensions/PluginCard.vue')['default']
