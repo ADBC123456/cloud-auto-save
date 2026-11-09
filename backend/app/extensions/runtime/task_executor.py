@@ -183,6 +183,12 @@ class TaskExecutor:
             account_manager = DatabaseAccountManager(self.db)
         task_data = self._task_to_dict(task)
         try:
+            from app.services.media_library import apply_category_to_task_data
+
+            apply_category_to_task_data(self.db, task_data)
+        except Exception:
+            logger.exception("媒体库分类: 补齐插件参数失败 task=%s", task_data.get("taskname"))
+        try:
             from app.services.magic_regex import get_enabled_magic_regex_map
 
             task_data["magic_regex"] = get_enabled_magic_regex_map(self.db)
@@ -294,6 +300,31 @@ class TaskExecutor:
         started_at = datetime.now()
         task_id = int(getattr(task, "id", 0) or 0)
         snapshot_row = None
+
+        if not str(task_data.get("shareurl") or "").strip():
+            # 开启自动搜索的任务可以先不填链接；运行前已尝试预填，仍为空就跳过，不算失败也不封禁
+            message = "分享链接为空，等待自动搜索填入"
+            log.set_stage("shareurl_missing")
+            log.section("分享链接")
+            log.line(f"跳过: {message}")
+            log.set_stage("end")
+            execution = TaskExecution(
+                task_id=task_id,
+                status='skipped',
+                started_at=started_at,
+                finished_at=datetime.now(),
+                message=message,
+                stage=log.stage,
+                run_log=log.render(),
+                adapter_snapshot=json.dumps({}, ensure_ascii=False),
+                plugins_snapshot=json.dumps([], ensure_ascii=False),
+            )
+            if not persist_execution:
+                execution.id = 0
+                return execution
+            self.db.add(execution)
+            self.db.flush()
+            return execution
 
         if adapter is None:
             log.set_stage("select_account")

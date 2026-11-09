@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routes import audit_logs, auth, auto_search, cache_management, dashboard, drive_accounts, health, magic_regex, media_discovery, metrics, notifications, openlist_settings, permissions, plugins, resource_search, roles, setup, sync_plugins, sync_tasks, tasks, tmdb_cache, tmdb_settings, users
+from app.api.routes import audit_logs, auth, auto_search, cache_management, dashboard, drive_accounts, health, magic_regex, media_discovery, media_library, metrics, notifications, openlist_settings, permissions, plugins, resource_search, roles, setup, sync_plugins, sync_tasks, tasks, tmdb_cache, tmdb_settings, users
 
 
 api_router = APIRouter()
@@ -22,6 +22,7 @@ api_router.include_router(resource_search.router, prefix="/resource-search", tag
 api_router.include_router(notifications.router, prefix="/notifications", tags=["notifications"])
 api_router.include_router(cache_management.router, prefix="/cache", tags=["cache"])
 api_router.include_router(openlist_settings.router, prefix="/openlist", tags=["openlist"])
+api_router.include_router(media_library.router, prefix="/media-library", tags=["media-library"])
 api_router.include_router(tmdb_settings.router, prefix="/tmdb", tags=["tmdb"])
 api_router.include_router(tmdb_cache.router, prefix="/tmdb", tags=["tmdb"])
 api_router.include_router(media_discovery.router, prefix="/media", tags=["media"])

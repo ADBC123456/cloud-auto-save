@@ -3,6 +3,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { deleteMagicRegexRule, fetchMagicRegexRules, upsertMagicRegexRule } from '@/api/magicRegex'
 import { fetchOpenListConfig, patchOpenListConfig } from '@/api/openlist'
+import MediaLibraryPanel from '@/components/settings/MediaLibraryPanel.vue'
 import { fetchResourceSearchSources, patchResourceSearchSource } from '@/api/resourceSearch'
 import { fetchTMDBConfig, patchTMDBConfig } from '@/api/tmdb'
 import { TASK_WRITE } from '@/constants/permissions'
@@ -17,7 +18,8 @@ const canWrite = computed(() => auth.permissions.includes(TASK_WRITE))
 
 const loading = ref(false)
 const rules = ref<MagicRegexRuleSetting[]>([])
-const activeTab = ref('magic_regex')
+const route = useRoute()
+const activeTab = ref(String(route.query.tab || '') || 'magic_regex')
 
 const resourceSearch = reactive({
   loading: false,
@@ -624,6 +626,10 @@ onMounted(() => {
             </el-form-item>
           </el-form>
         </el-card>
+      </el-tab-pane>
+
+      <el-tab-pane label="媒体库分类" name="media_library" lazy>
+        <MediaLibraryPanel :can-write="canWrite" />
       </el-tab-pane>
 
       <el-tab-pane label="OpenList" name="openlist">

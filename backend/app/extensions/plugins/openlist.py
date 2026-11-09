@@ -16,22 +16,22 @@ class Openlist:
     plugin_version = "0.1.0"
 
     default_config = {
-        "url": "",
-        "token": "",
-        "storage_id": "",
-        "root_dir": "",
+        "url": "",  # OpenList 服务器地址，如 http://172.17.0.1:5244
+        "token": "",  # OpenList 管理员 Token（媒体库分类需要它拉取存储列表）
+        "storage_id": "",  # 可选：全局默认存储ID 或 /挂载路径:/网盘根目录；配置了「媒体库分类」可留空
+        "root_dir": "",  # 可选：全局默认存储对应的网盘根目录
         "rclone_rc_url": "",  # rclone 目录缓存刷新地址
         "rclone_rc_username": "",  # rclone RC 用户名
         "rclone_rc_password": "",  # rclone RC 密码
     }
 
     default_task_config = {
-        "enable": True,
-        "driver": "",
-        "mount_path": "",
-        "root_dir": "",
-        "password": "",
-        "refresh": True,
+        "enable": True,  # 转存后刷新 OpenList 目录
+        "driver": "",  # OpenList 存储ID（选了媒体库分类会自动填）
+        "mount_path": "",  # OpenList 挂载路径（选了媒体库分类会自动填）
+        "root_dir": "",  # 挂载路径对应的网盘目录（选了媒体库分类会自动填）
+        "password": "",  # 目录密码（一般留空）
+        "refresh": True,  # 强制刷新目录缓存
     }
 
     is_active = False
@@ -90,6 +90,9 @@ class Openlist:
                         root_dir=self.root_dir,
                     )
                     self.is_active = True
+        elif self.url and self._check_connection():
+            # 未配置全局存储：挂载路径等参数由任务或「媒体库分类」提供
+            self.is_active = True
 
     def _rebuild_caches(self):
         with self._cache_lock:

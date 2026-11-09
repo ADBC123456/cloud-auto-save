@@ -15,6 +15,7 @@ class Emby:
     default_task_config = {
         "try_match": True,  # 是否尝试匹配
         "media_id": "",  # 媒体ID，当为0时不刷新
+        "library_id": "",  # 新剧未匹配到时刷新的媒体库ID（选了媒体库分类会自动填，留空用全局设置）
     }
     is_active = False
 
@@ -44,8 +45,8 @@ class Emby:
                 task_config["media_id"] = match_media_id
                 task.setdefault("addition", {})[self.plugin_name] = task_config
                 return task
-            elif self.library_id:
-                self.refresh(self.library_id)
+            elif library_id := str(task_config.get("library_id") or "").strip() or self.library_id:
+                self.refresh(library_id)
 
     def get_info(self):
         url = f"{self.url}/emby/System/Info"

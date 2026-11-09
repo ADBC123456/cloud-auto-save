@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field
 class TaskBase(BaseModel):
     task_type: str = Field(default="generic", max_length=32)
     taskname: str = Field(min_length=1, max_length=255)
-    shareurl: str = Field(min_length=1)
+    # 开启自动搜索的任务允许留空（由自动搜索填入）；是否必填由 services.tasks.create_task 校验
+    shareurl: str = ""
     savepath: str = Field(min_length=1, max_length=255)
     sync_task_uids: list[str] | None = None
     pattern: str | None = Field(default=None, max_length=255)

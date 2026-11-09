@@ -4,6 +4,7 @@ from app.models.drive_account import DriveAccount
 from app.models.drive_account_probe_scheduler_setting import DriveAccountProbeSchedulerSetting
 from app.models.invalid_share_link import InvalidShareLink
 from app.models.magic_regex_rule import MagicRegexRule
+from app.models.media_category import MediaCategory
 from app.models.notification_setting import NotificationSetting
 from app.models.openlist_setting import OpenListSetting
 from app.models.permission import Permission
@@ -38,6 +39,7 @@ __all__ = [
     "DriveAccountProbeSchedulerSetting",
     "InvalidShareLink",
     "MagicRegexRule",
+    "MediaCategory",
     "NotificationSetting",
     "OpenListSetting",
     "Permission",

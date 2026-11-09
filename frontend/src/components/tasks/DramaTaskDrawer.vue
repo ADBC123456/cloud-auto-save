@@ -6,8 +6,10 @@ import { browseDrive, fetchMagicRegex, fetchTasks, previewShare, previewShareBat
 import { fetchResourceSearchSources } from '@/api/resourceSearch'
 import { fetchTMDBConfig } from '@/api/tmdb'
 import { fetchTaskSuggestions } from '@/api/resourceSearch'
+import { fetchMediaCategories } from '@/api/mediaLibrary'
 import type { DriveAccountItem, PluginItem } from '@/types/extensions'
 import type { TMDBBrief } from '@/types/media'
+import type { MediaCategory } from '@/types/mediaLibrary'
 import type { TaskSuggestionItem } from '@/types/resourceSearch'
 import type { SyncTaskItem } from '@/types/syncTasks'
 import type { DriveBrowseItem, MagicRegexRule, SharePreviewItem, TaskItem } from '@/types/tasks'
@@ -235,6 +237,31 @@ const saveAuto = reactive({
   tasks: null as TaskItem[] | null,
   tmdbDetailCache: {} as Record<string, any>,
 })
+
+// 媒体库分类：选分类即自动填保存路径，OpenList/Emby 参数由后端执行时按分类补齐
+const CATEGORY_PLUGINS = new Set(['openlist', 'emby'])
+const TMDB_CATEGORY_KIND: Record<string, string> = { 电视剧: 'tv', 动漫: 'anime', 综艺: 'variety', 电影: 'movie' }
+const COUNTRY_KEYWORDS: Record<string, string[]> = {
+  CN: ['国产', '国剧', '国漫', '大陆', '内地', '华语', '中国'],
+  HK: ['港', '华语'],
+  TW: ['台', '华语'],
+  US: ['美', '欧美'],
+  GB: ['英', '欧美'],
+  JP: ['日', '番'],
+  KR: ['韩'],
+  TH: ['泰'],
+}
+
+const mediaCat = reactive({
+  items: [] as MediaCategory[],
+  selectedId: null as number | null,
+  userPicked: false,
+  autoPicked: false,
+  timer: null as any,
+})
+const pluginAdvanced = reactive({} as Record<string, boolean>)
+
+const selectedCategory = computed(() => mediaCat.items.find((c) => c.id === mediaCat.selectedId) || null)
 
 const viewport = reactive({ width: window.innerWidth })
 const isMobile = computed(() => viewport.width <= 768)
@@ -959,6 +986,8 @@ async function autoFillSavepath(runId: number) {
   if (isEditing.value && currentSave && currentSave !== saveAuto.lastApplied) return
   if (currentSave && currentSave !== saveAuto.lastApplied) return
 
+  if (await autoApplyCategory(runId)) return
+
   const dt = currentDriveType()
   if (!dt) return
 
@@ -1015,6 +1044,196 @@ async function autoFillSavepath(runId: number) {
   }
 }
 
+function isUnderPath(path: string, root: string) {
+  const p = normalizeSavepath(path)
+  const r = normalizeSavepath(root)
+  if (!p || !r) return false
+  return r === '/' || p === r || p.startsWith(`${r}/`)
+}
+
+function categoryForSavepath(savepath: string, driveType: string | null) {
+  let best: MediaCategory | null = null
+  let bestDepth = -1
+  for (const c of mediaCat.items) {
+    if (!isUnderPath(savepath, c.cloud_root)) continue
+    if (c.drive_type && driveType && c.drive_type !== driveType) continue
+    const depth = normalizeSavepath(c.cloud_root).split('/').filter(Boolean).length
+    if (depth > bestDepth) {
+      best = c
+      bestDepth = depth
+    }
+  }
+  return best
+}
+
+function setSelectedCategory(cat: MediaCategory | null) {
+  mediaCat.selectedId = cat ? cat.id : null
+  if (cat) (state.extra as any).media_category_id = cat.id
+  else delete (state.extra as any).media_category_id
+}
+
+function tmdbCountries(detail: any) {
+  const out = new Set<string>()
+  for (const c of Array.isArray(detail?.origin_country) ? detail.origin_country : []) out.add(String(c || '').toUpperCase())
+  for (const c of Array.isArray(detail?.production_countries) ? detail.production_countries : []) {
+    out.add(String(c?.iso_3166_1 || '').toUpperCase())
+  }
+  return Array.from(out).filter(Boolean)
+}
+
+function guessCategory(detail: any) {
+  const mt = String(state.tmdb_media_type || '').toLowerCase()
+  const kind = TMDB_CATEGORY_KIND[categoryFromTmdb(mt, detail)] || ''
+  if (!kind) return null
+  const dt = currentDriveType()
+  let pool = mediaCat.items.filter((c) => c.kind === kind && (!dt || !c.drive_type || c.drive_type === dt))
+  if (pool.length > 1) {
+    const words = tmdbCountries(detail).flatMap((code) => COUNTRY_KEYWORDS[code] || [])
+    const narrowed = pool.filter((c) => words.some((w) => String(c.name || '').includes(w)))
+    if (narrowed.length) pool = narrowed
+  }
+  return pool[0] || null
+}
+
+function clearCategoryPluginOverrides() {
+  const ol: any = (state.addition as any).openlist
+  if (ol && typeof ol === 'object') {
+    ol.driver = ''
+    ol.mount_path = ''
+    ol.root_dir = ''
+  }
+  const em: any = (state.addition as any).emby
+  if (em && typeof em === 'object') em.library_id = ''
+}
+
+async function applyCategory(cat: MediaCategory) {
+  setSelectedCategory(cat)
+  clearCategoryPluginOverrides()
+  const detail = await getTmdbDetailForCurrent()
+  if (mediaCat.selectedId !== cat.id) return
+  const mt = String(state.tmdb_media_type || '').toLowerCase()
+  const titleFromTmdb = String(detail?.name || detail?.title || '').trim()
+  const nameSeg = appendYearSuffix(String(state.taskname || '').trim() || titleFromTmdb, yearFromTmdbDetail(mt, detail))
+  const root = normalizeSavepath(cat.cloud_root)
+  const suggested = nameSeg ? normalizeSavepath(`${root}/${nameSeg}`) : root
+  saveAuto.applying = true
+  try {
+    state.savepath = suggested
+    saveAuto.lastApplied = suggested
+    saveAuto.touched = false
+  } finally {
+    saveAuto.applying = false
+  }
+}
+
+// 新建任务时按 TMDB 类型自动选分类；用户手动选过分类时只更新路径里的剧名
+async function autoApplyCategory(runId: number) {
+  if (!props.modelValue || !mediaCat.items.length) return false
+  if (saveAuto.touched) return false
+  const currentSave = String(state.savepath || '').trim()
+  if (currentSave && currentSave !== saveAuto.lastApplied) return false
+  if (mediaCat.userPicked && !selectedCategory.value) return false
+  let cat = mediaCat.userPicked ? selectedCategory.value : null
+  if (!cat) {
+    if (isEditing.value) return false
+    const detail = await getTmdbDetailForCurrent()
+    if (runId !== shareAuto.runId || saveAuto.touched) return false
+    cat = guessCategory(detail)
+    if (!cat) return false
+    mediaCat.autoPicked = true
+  }
+  await applyCategory(cat)
+  return true
+}
+
+function scheduleAutoApplyCategory() {
+  if (!props.modelValue || !mediaCat.items.length) return
+  if (mediaCat.timer) clearTimeout(mediaCat.timer)
+  const runId = shareAuto.runId
+  mediaCat.timer = setTimeout(() => {
+    autoApplyCategory(runId).catch(() => {})
+  }, 350)
+}
+
+async function onCategorySelect(value: number | string | null | undefined) {
+  const id = Number(value) || 0
+  const cat = mediaCat.items.find((c) => c.id === id) || null
+  mediaCat.userPicked = true
+  mediaCat.autoPicked = false
+  if (!cat) {
+    setSelectedCategory(null)
+    return
+  }
+  await applyCategory(cat)
+}
+
+function initCategorySelection() {
+  const id = Number((state.extra as any)?.media_category_id) || 0
+  let cat = id ? mediaCat.items.find((c) => c.id === id) || null : null
+  if (!cat && String(state.savepath || '').trim()) cat = categoryForSavepath(state.savepath, currentDriveType())
+  if (cat || id) setSelectedCategory(cat)
+  else mediaCat.selectedId = null
+}
+
+async function loadMediaCategories() {
+  try {
+    mediaCat.items = await fetchMediaCategories({ silentToast: true })
+  } catch {
+    mediaCat.items = []
+  }
+  if (!props.modelValue) return
+  initCategorySelection()
+  if (!isEditing.value && !mediaCat.selectedId) scheduleAutoApplyCategory()
+}
+
+// 手动改保存路径（输入或「选择目录」）时，自动对应到所属分类
+function syncCategoryFromSavepath() {
+  if (!mediaCat.items.length) return
+  const sp = String(state.savepath || '').trim()
+  const sel = selectedCategory.value
+  if (sel && isUnderPath(sp, sel.cloud_root)) return
+  const cat = sp ? categoryForSavepath(sp, currentDriveType()) : null
+  if ((cat?.id ?? null) === mediaCat.selectedId) return
+  mediaCat.autoPicked = false
+  setSelectedCategory(cat)
+}
+
+function categoryPluginOverridden(key: string) {
+  const cfg: any = (state.addition as any)[key] || {}
+  if (key === 'openlist') return Boolean(String(cfg.driver || cfg.mount_path || cfg.root_dir || '').trim())
+  if (key === 'emby') return Boolean(String(cfg.library_id || '').trim())
+  return false
+}
+
+function categoryPluginSummary(key: string) {
+  const cat = selectedCategory.value
+  if (!cat) return ''
+  const cfg: any = (state.addition as any)[key] || {}
+  const manual = categoryPluginOverridden(key) ? '（高级参数里有手动填写的值，优先使用）' : ''
+  if (key === 'openlist') {
+    if (cfg.enable === false) return '已关闭 OpenList 刷新。'
+    const mount = normalizeSavepath(String(cfg.mount_path || cat.openlist_mount_path || ''))
+    const root = normalizeSavepath(String(cfg.root_dir || cat.openlist_root_dir || ''))
+    if (!mount || !root) return `分类「${cat.name}」没有设置 OpenList 存储，不会刷新 OpenList。${manual}`
+    const sp = normalizeSavepath(state.savepath)
+    if (!isUnderPath(sp, root)) return `保存路径不在 OpenList 存储对应的网盘目录 ${root} 下，不会刷新 OpenList。${manual}`
+    const rel = root === '/' ? sp : sp.slice(root.length)
+    return `已按分类「${cat.name}」自动配置：转存后刷新 OpenList 目录 ${normalizeSavepath(`${mount}/${rel}`)}${manual}`
+  }
+  if (key === 'emby') {
+    if (String(cfg.media_id || '') === '0') return 'media_id 为 0，不刷新 Emby。'
+    const libraryId = String(cfg.library_id || cat.emby_library_id || '')
+    if (!libraryId) return `已按剧名匹配刷新 Emby；分类「${cat.name}」没有设置 Emby 媒体库。${manual}`
+    const name = libraryId === cat.emby_library_id ? cat.emby_library_name || libraryId : libraryId
+    return `已按分类「${cat.name}」自动配置：先按剧名匹配刷新，新剧刷新 Emby 媒体库「${name}」${manual}`
+  }
+  return ''
+}
+
+function isCategoryManagedPlugin(key: string) {
+  return Boolean(selectedCategory.value) && CATEGORY_PLUGINS.has(key)
+}
+
 function syncState() {
   if (shareAuto.timer) {
     clearTimeout(shareAuto.timer)
@@ -1022,6 +1241,10 @@ function syncState() {
   }
   autoFill.loading = false
   shareAuto.lastResolved = ''
+  mediaCat.selectedId = null
+  mediaCat.userPicked = false
+  mediaCat.autoPicked = false
+  for (const key of Object.keys(pluginAdvanced)) delete pluginAdvanced[key]
   if (props.task) {
     state.taskname = props.task.taskname
     shareAuto.lastResolved = String(props.task.shareurl || '').trim()
@@ -1139,6 +1362,7 @@ watch(
       saveAuto.lastApplied = ''
       return
     }
+    syncCategoryFromSavepath()
     if (s === saveAuto.lastApplied) return
     saveAuto.touched = true
   },
@@ -1150,6 +1374,7 @@ watch(
     if (!visible) return
     syncState()
     refreshMagicRegex()
+    loadMediaCategories()
     try {
       const cfg = await fetchTMDBConfig()
       tmdbLink.configured = Boolean(cfg?.has_api_key)
@@ -1678,6 +1903,15 @@ watch(
 )
 
 watch(
+  () => [state.taskname, state.tmdb_id, state.tmdb_media_type, state.account_choice] as const,
+  () => {
+    // 有分享链接时由上面的 autoFillSavepath 处理（它会先尝试媒体库分类）
+    if (String(state.shareurl || '').trim()) return
+    scheduleAutoApplyCategory()
+  },
+)
+
+watch(
   () => state.taskname,
   (value) => {
     if (!props.modelValue) return
@@ -1817,6 +2051,29 @@ watch(
 
       <div class="drawer-form__section">
         <div class="drawer-form__section-title">保存目录</div>
+        <el-form-item label="媒体库分类">
+          <el-select
+            :model-value="mediaCat.selectedId ?? undefined"
+            style="width: 100%"
+            clearable
+            filterable
+            :placeholder="mediaCat.items.length ? '选择分类，自动填写保存路径和 OpenList / Emby 参数' : '还没有配置媒体库分类'"
+            :disabled="!mediaCat.items.length"
+            @update:model-value="onCategorySelect"
+          >
+            <el-option v-for="c in mediaCat.items" :key="c.id" :label="c.name" :value="c.id">
+              <span>{{ c.name }}</span>
+              <span class="category-option__sub">{{ c.cloud_root }}</span>
+            </el-option>
+          </el-select>
+          <div v-if="!mediaCat.items.length" class="drawer-form__hint">
+            在 <router-link to="/settings?tab=media_library">系统设置 → 媒体库分类</router-link> 点「一键识别」配置一次，以后建任务只需选分类。
+          </div>
+          <div v-else-if="selectedCategory" class="drawer-form__hint">
+            {{ mediaCat.autoPicked ? (state.tmdb_id ? '已按 TMDB 类型自动选择，可修改。' : '已自动选择（未关联 TMDB，按电视剧处理），可修改。') : '' }}保存到 {{ selectedCategory.cloud_root }} 下；转存后自动刷新 OpenList<template v-if="selectedCategory.emby_library_name">、Emby 媒体库「{{ selectedCategory.emby_library_name }}」</template>。
+          </div>
+          <div v-else class="drawer-form__hint">选择分类后会自动填写保存路径，OpenList / Emby 参数无需手填。</div>
+        </el-form-item>
         <el-form-item label="保存路径（savepath）">
           <el-input v-model="state.savepath" placeholder="/剧集/某电视剧" />
         </el-form-item>
@@ -1935,6 +2192,13 @@ watch(
         <div v-else class="plugin-stack">
           <div v-for="plugin in plugins" :key="plugin.plugin_key" class="plugin-block">
             <div class="plugin-block__title">{{ plugin.plugin_key }}</div>
+            <template v-if="isCategoryManagedPlugin(plugin.plugin_key)">
+              <div class="drawer-form__hint plugin-block__summary">{{ categoryPluginSummary(plugin.plugin_key) }}</div>
+              <el-button link type="primary" @click="pluginAdvanced[plugin.plugin_key] = !pluginAdvanced[plugin.plugin_key]">
+                {{ pluginAdvanced[plugin.plugin_key] ? '收起高级参数' : '高级参数（一般无需修改）' }}
+              </el-button>
+            </template>
+            <template v-if="!isCategoryManagedPlugin(plugin.plugin_key) || pluginAdvanced[plugin.plugin_key]">
             <el-form-item v-for="field in plugin.task_config_fields || []" :key="field.key" :label="field.label || field.key">
               <el-switch
                 v-if="field.input_type === 'switch'"
@@ -1959,6 +2223,7 @@ watch(
               />
               <div v-if="field.description" class="drawer-form__hint">{{ field.description }}</div>
             </el-form-item>
+            </template>
           </div>
         </div>
       </div>
@@ -2283,6 +2548,16 @@ watch(
   border-radius: 16px;
   background: var(--el-fill-color-blank);
   border: 1px solid var(--el-border-color-lighter);
+}
+
+.plugin-block__summary {
+  margin: 4px 0 2px;
+}
+
+.category-option__sub {
+  margin-left: 10px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 .plugin-block__title {
