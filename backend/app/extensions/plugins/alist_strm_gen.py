@@ -6,7 +6,7 @@ import re
 import json
 import logging
 import requests
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from app.thirdparty.openlist_client import OpenListClient
 
@@ -75,7 +75,7 @@ class Alist_strm_gen:
         mapped = self._map_task_savepath(savepath)
         if not mapped:
             return
-        self.check_dir(mapped)
+        self.check_dir(mapped, force_refresh=True)
 
     @staticmethod
     def _norm_path(path: str) -> str:
@@ -275,24 +275,44 @@ class Alist_strm_gen:
         else:
             return False, (None, None)
 
-    def check_dir(self, path):
+    def check_dir(self, path, force_refresh=False):
         if not self.client:
             return
         normalized = self._norm_path(path)
         try:
-            files = self._iter_dir_items(normalized, force_refresh=False)
+            files = self._iter_dir_items(normalized, force_refresh=force_refresh)
         except Exception as e:
             logger.warning("📺 Alist-Strm生成: 获取文件列表失败 %s", e)
             return
+        expected = set()
         for item in files:
             name = self._pick_name(item).strip()
             if not name or name in {".", ".."}:
                 continue
             item_path = self._norm_path(posixpath.join(normalized, name))
             if self._bool_is_dir(item):
-                self.check_dir(item_path)
+                expected.add(name)
+                self.check_dir(item_path, force_refresh=force_refresh)
             else:
+                if name.split(".")[-1].lower() in self.video_exts:
+                    expected.add(os.path.splitext(name)[0] + ".strm")
                 self.generate_strm(item_path, item)
+        self.prune_strm(normalized, expected, bool(files))
+
+    def prune_strm(self, path, expected, listed):
+        # 源文件被删除/重命名后，清理对应的失效 strm（列表为空时不清理，避免网络异常误删）
+        if not listed:
+            return
+        strm_dir = f"{self.strm_save_dir}{path}".replace("//", "/")
+        if not os.path.isdir(strm_dir):
+            return
+        for name in os.listdir(strm_dir):
+            if name.endswith(".strm") and name not in expected:
+                try:
+                    os.remove(os.path.join(strm_dir, name))
+                    logger.info("📺 删除失效STRM文件 %s", os.path.join(strm_dir, name))
+                except Exception as e:
+                    logger.warning("📺 删除失效STRM失败 %s", e)
 
     def generate_strm(self, file_path, file_info):
         ext = file_path.split(".")[-1]
@@ -325,7 +345,7 @@ class Alist_strm_gen:
                     url = None
             if not url:
                 sign_param = "" if not file_info.get("sign") else f"?sign={file_info['sign']}"
-                url = f"{self.strm_server}{file_path}{sign_param}"
+                url = f"{self.strm_server}{quote(file_path)}{sign_param}"
             with open(strm_path, "w", encoding="utf-8") as strm_file:
                 strm_file.write(url)
             logger.info("📺 生成STRM文件 %s 成功", strm_path)

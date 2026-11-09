@@ -39,7 +39,7 @@ const isDark = computed({
 const buildTag = ref<string | null>(null)
 const buildSha = ref<string | null>(null)
 const latestTag = ref<string | null>(null)
-const updateUrl = computed(() => 'https://github.com/ozoo0/cloud-auto-save-x/releases')
+const updateUrl = computed(() => 'https://github.com/ADBC123456/cloud-auto-save/tags')
 const showUpdateBadge = computed(() => {
   const current = (buildTag.value || '').trim() || 'dev'
   const latest = (latestTag.value || '').trim()
@@ -101,7 +101,7 @@ async function handleLogout() {
 
 async function checkNewVersion() {
   try {
-    const res = await fetch('https://api.github.com/repos/ozoo0/cloud-auto-save-x/tags', {
+    const res = await fetch('https://api.github.com/repos/ADBC123456/cloud-auto-save/tags', {
       method: 'GET',
       headers: { Accept: 'application/vnd.github+json' },
     })

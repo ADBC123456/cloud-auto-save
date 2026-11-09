@@ -612,6 +612,12 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         headers = dict(PAN_HEADERS)
         headers["Referer"] = init_url
 
+        # Initialize the share page first so Baidu issues the verification cookie.
+        try:
+            init_resp = self._request("GET", init_url, headers=dict(PAN_HEADERS))
+            self._session.cookies.update(init_resp.cookies.get_dict())
+        except Exception as e:
+            logger.debug("[Baidu] share init failed: %s", e)
         resp = self._request("POST", url, params=params, headers=headers, data=data)
         resp.raise_for_status()
 
@@ -631,6 +637,19 @@ class BaiduAdapter(BaseCloudDriveAdapter):
 
         # 更新 cookies
         self._session.cookies.update(resp.cookies.get_dict())
+
+        # 新版分享页：<script id="locals-data" type="application/json">{...}</script>
+        match = re.search(r'<script[^>]*id="locals-data"[^>]*>(.+?)</script>', html, flags=re.DOTALL)
+        if match:
+            try:
+                shared_data = json.loads(match.group(1).strip())
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Baidu] 解析 locals-data 失败，尝试旧格式: {e}")
+            else:
+                if isinstance(shared_data, dict) and "file_list" in shared_data:
+                    return self._check_share_response(shared_data)
+                if isinstance(shared_data, dict) and shared_data.get("errno") not in (None, 0, "0"):
+                    self._check_share_response(shared_data)
 
         # 解析 yunData.setData 或 locals.mset
         decoder = json.JSONDecoder()
